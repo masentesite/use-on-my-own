@@ -35,10 +35,10 @@ import numpy as np
 import torch
 
 # ---------------- 默认路径(本机固定项,可被命令行覆盖)----------------
-REPO = "/home/ubuntu24/桌面/ai/grounding_dino/GroundingDINO"
+REPO = "./GroundingDINO"
 DEFAULT_DATA = "../TrainSet."
 DEFAULT_CFG = f"{REPO}/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-DEFAULT_WEIGHTS = "/home/ubuntu24/桌面/ai/grounding_dino/weights/groundingdino_swint_ogc.pth"
+DEFAULT_WEIGHTS = "./weights/groundingdino_swint_ogc.pth"
 
 sys.path.insert(0, REPO)
 
