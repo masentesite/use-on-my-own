@@ -1,0 +1,31 @@
+# ===== 大数据集:不上传 =====
+data/
+TrainSet./
+
+# ===== 模型权重:不上传 =====
+grounding_dino/weights/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# ===== Python 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== Python 构建产物 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+wheels/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+
+# ===== 日志 =====
+*.log
