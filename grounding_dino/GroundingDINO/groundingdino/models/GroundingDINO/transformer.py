@@ -26,6 +26,7 @@ from groundingdino.util.misc import inverse_sigmoid
 
 from .fuse_modules import BiAttentionBlock
 from .ms_deform_attn import MultiScaleDeformableAttention as MSDeformAttn
+from .multimodal_modules import BottleneckAdapter
 from .transformer_vanilla import TransformerEncoderLayer
 from .utils import (
     MLP,
@@ -71,6 +72,11 @@ class Transformer(nn.Module):
         text_dropout=0.1,
         fusion_dropout=0.1,
         fusion_droppath=0.0,
+        # for multimodal adapters (多模态改造 方案 §10)
+        use_encoder_adapter=False,
+        use_decoder_adapter=False,
+        adapter_dim=64,
+        adapter_dropout=0.0,
     ):
         super().__init__()
         self.num_feature_levels = num_feature_levels
@@ -107,6 +113,15 @@ class Transformer(nn.Module):
         else:
             feature_fusion_layer = None
 
+        # 多模态 Adapter (方案 §10)。这里只造一个原型, 由 _get_clones 深拷贝成每层一份。
+        # 输出层零初始化 => 训练起点上 y == x, 模型等价于原始 RGB GroundingDINO。
+        encoder_adapter = (
+            BottleneckAdapter(d_model, adapter_dim, adapter_dropout) if use_encoder_adapter else None
+        )
+        decoder_adapter = (
+            BottleneckAdapter(d_model, adapter_dim, adapter_dropout) if use_decoder_adapter else None
+        )
+
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         assert encoder_norm is None
         self.encoder = TransformerEncoder(
@@ -118,6 +133,7 @@ class Transformer(nn.Module):
             feature_fusion_layer=feature_fusion_layer,
             use_checkpoint=use_checkpoint,
             use_transformer_ckpt=use_transformer_ckpt,
+            encoder_adapter=encoder_adapter,
         )
 
         # choose decoder layer type
@@ -141,6 +157,7 @@ class Transformer(nn.Module):
             d_model=d_model,
             query_dim=query_dim,
             num_feature_levels=num_feature_levels,
+            decoder_adapter=decoder_adapter,
         )
 
         self.d_model = d_model
@@ -195,6 +212,11 @@ class Transformer(nn.Module):
                 m._reset_parameters()
         if self.num_feature_levels > 1 and self.level_embed is not None:
             nn.init.normal_(self.level_embed)
+        # ⚠️ 必须放在最后:上面的 xavier_uniform_ 会把 Adapter 输出层的零初始化覆盖掉,
+        # 而 Adapter 的零初始化正是「训练起点等价于原始 RGB 模型」的前提。
+        for m in self.modules():
+            if isinstance(m, BottleneckAdapter):
+                m.reset_parameters()
 
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
@@ -415,6 +437,7 @@ class TransformerEncoder(nn.Module):
         feature_fusion_layer=None,
         use_checkpoint=False,
         use_transformer_ckpt=False,
+        encoder_adapter=None,
     ):
         """_summary_
 
@@ -432,6 +455,7 @@ class TransformerEncoder(nn.Module):
         self.layers = []
         self.text_layers = []
         self.fusion_layers = []
+        self.vision_adapters = []
         if num_layers > 0:
             self.layers = _get_clones(encoder_layer, num_layers, layer_share=enc_layer_share)
 
@@ -443,6 +467,9 @@ class TransformerEncoder(nn.Module):
                 self.fusion_layers = _get_clones(
                     feature_fusion_layer, num_layers, layer_share=enc_layer_share
                 )
+            if encoder_adapter is not None:
+                # 每层一份独立 Adapter(_get_clones 走 deepcopy), 逐层适配多模态特征
+                self.vision_adapters = _get_clones(encoder_adapter, num_layers, layer_share=False)
         else:
             self.layers = []
             del encoder_layer
@@ -453,6 +480,8 @@ class TransformerEncoder(nn.Module):
             if feature_fusion_layer is not None:
                 self.fusion_layers = []
                 del feature_fusion_layer
+            if encoder_adapter is not None:
+                del encoder_adapter
 
         self.query_scale = None
         self.num_queries = num_queries
@@ -571,6 +600,12 @@ class TransformerEncoder(nn.Module):
                     pos=(pos_text.transpose(0, 1) if pos_text is not None else None),
                 ).transpose(0, 1)
 
+            # 多模态 Adapter (方案 §10):插在 BiAttentionBlock 之后、Deformable encoder layer
+            # 之前。原始的视觉-语言融合仍然保留, 但在进入 deformable attention 前模型可以
+            # 对多模态特征做一次修正, 缓解融合特征与 RGB 特征分布不一致的问题。
+            if self.vision_adapters:
+                output = self.vision_adapters[layer_id](output)
+
             # main process
             if self.use_transformer_ckpt:
                 output = checkpoint.checkpoint(
@@ -605,12 +640,19 @@ class TransformerDecoder(nn.Module):
         d_model=256,
         query_dim=4,
         num_feature_levels=1,
+        decoder_adapter=None,
     ):
         super().__init__()
         if num_layers > 0:
             self.layers = _get_clones(decoder_layer, num_layers)
+            self.decoder_adapters = (
+                _get_clones(decoder_adapter, num_layers) if decoder_adapter is not None else []
+            )
         else:
             self.layers = []
+            self.decoder_adapters = []
+            if decoder_adapter is not None:
+                del decoder_adapter
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
@@ -701,6 +743,14 @@ class TransformerDecoder(nn.Module):
                 self_attn_mask=tgt_mask,
                 cross_attn_mask=memory_mask,
             )
+
+            # 多模态 Decoder Adapter (方案 §10):每个 decoder layer 的文本 cross-attention、
+            # 视觉 cross-attention 和 FFN 全部完成之后再做一次修正。
+            # 必须放在 iter-update 之前 —— 修正后的 output 才应该是 bbox_embed 的输入,
+            # 否则参考框会基于未修正的 query 更新, adapter 对框回归就没有影响。
+            if self.decoder_adapters:
+                output = self.decoder_adapters[layer_id](output)
+
             if output.isnan().any() | output.isinf().any():
                 print(f"output layer_id {layer_id} is nan")
                 try:
@@ -956,4 +1006,9 @@ def build_transformer(args):
         text_dropout=args.text_dropout,
         fusion_dropout=args.fusion_dropout,
         fusion_droppath=args.fusion_droppath,
+        # 多模态 Adapter(getattr 兜底, 保证旧的 RGB config 仍然可构建)
+        use_encoder_adapter=getattr(args, "encoder_adapter", False),
+        use_decoder_adapter=getattr(args, "decoder_adapter", False),
+        adapter_dim=getattr(args, "adapter_dim", 64),
+        adapter_dropout=getattr(args, "adapter_dropout", 0.0),
     )

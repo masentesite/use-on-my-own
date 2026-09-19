@@ -1,0 +1,7 @@
+{
+  "stage": 1,
+  "epochs": 1,
+  "global_step": 50,
+  "best_mean_iou": 0.31777987704767247,
+  "out_dir": "runs/gpu_probe"
+}

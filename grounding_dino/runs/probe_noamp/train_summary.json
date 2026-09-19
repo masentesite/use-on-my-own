@@ -1,0 +1,7 @@
+{
+  "stage": 1,
+  "epochs": 1,
+  "global_step": 15,
+  "best_mean_iou": -1.0,
+  "out_dir": "runs/probe_noamp"
+}

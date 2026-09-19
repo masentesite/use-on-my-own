@@ -1,0 +1,7 @@
+{
+  "stage": 1,
+  "epochs": 1,
+  "global_step": 4,
+  "best_mean_iou": 0.37412104520330225,
+  "out_dir": "/home/ubuntu24/桌面/ai/grounding_dino/runs/smoke"
+}

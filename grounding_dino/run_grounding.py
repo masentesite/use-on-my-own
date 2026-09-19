@@ -24,8 +24,29 @@ import sys
 import time
 
 # ---- 代理环境变量必须在 import torch / transformers 之前设好 ----
-os.environ["ALL_PROXY"] = "http://127.0.0.1:7892"
-os.environ["all_proxy"] = "http://127.0.0.1:7892"
+# 本机的 clash/v2ray 混合端口不固定, 且云端根本没有这个代理。原来无条件写死
+# 127.0.0.1:7892 会让「有网但没开代理」和「云端」两种情况都把 HF 请求送进黑洞。
+# 改成条件探测: 端口真在监听才设, 否则保持环境原样。
+_PROXY_PORT = 7892
+_PROXY = f"http://127.0.0.1:{_PROXY_PORT}"
+
+
+def _proxy_alive(port: int) -> bool:
+    import socket
+
+    with socket.socket() as s:
+        s.settimeout(0.2)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+if _proxy_alive(_PROXY_PORT):
+    os.environ["ALL_PROXY"] = _PROXY
+    os.environ["all_proxy"] = _PROXY
+    print(f"[env] 检测到本地代理 {_PROXY}, 已启用")
+else:
+    os.environ.pop("ALL_PROXY", None)   # 清掉外部可能继承进来的失效代理
+    os.environ.pop("all_proxy", None)
+
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 for _v in ("no_proxy", "NO_PROXY"):
     if "hf-mirror.com" not in os.environ.get(_v, ""):

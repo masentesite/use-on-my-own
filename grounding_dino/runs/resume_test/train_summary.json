@@ -1,0 +1,7 @@
+{
+  "stage": 1,
+  "epochs": 3,
+  "global_step": 15,
+  "best_mean_iou": 0.415727398754557,
+  "out_dir": "runs/resume_test"
+}
