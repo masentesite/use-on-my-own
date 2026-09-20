@@ -1,0 +1,91 @@
+{
+  "stage": 1,
+  "epochs": 1,
+  "global_step": 4,
+  "best_mean_iou": 0.3683306695415471,
+  "out_dir": "/home/ubuntu24/桌面/ai/grounding_dino/runs/smoke_rep1",
+  "fusion_type": "local_cross_attention_spatial_gate",
+  "gate_stats": {
+    "gate_rgb_mean/l0": 0.8169599771499634,
+    "gate_ir_mean/l0": 0.09078271687030792,
+    "gate_depth_mean/l0": 0.09225732088088989,
+    "aux_ir_ratio/l0": 0.14237286150455475,
+    "aux_depth_ratio/l0": 0.10047657787799835,
+    "gate_rgb_mean/l1": 0.8343554735183716,
+    "gate_ir_mean/l1": 0.07081374526023865,
+    "gate_depth_mean/l1": 0.09483080357313156,
+    "aux_ir_ratio/l1": 0.10908965021371841,
+    "aux_depth_ratio/l1": 0.10633061826229095,
+    "gate_rgb_mean/l2": 0.8117896318435669,
+    "gate_ir_mean/l2": 0.07740845531225204,
+    "gate_depth_mean/l2": 0.11080187559127808,
+    "aux_ir_ratio/l2": 0.1201527938246727,
+    "aux_depth_ratio/l2": 0.12835101783275604,
+    "gate_rgb_mean": 0.8210350275039673,
+    "gate_ir_mean": 0.0796683058142662,
+    "gate_depth_mean": 0.09929666668176651,
+    "aux_ir_ratio": 0.12387176603078842,
+    "aux_depth_ratio": 0.11171940714120865
+  },
+  "modality_eval": {
+    "rgb": {
+      "n": 4,
+      "acc@0.25": 0.5,
+      "acc@0.5": 0.25,
+      "acc@0.75": 0.25,
+      "mean_iou": 0.37138983677206666,
+      "median_iou": 0.3372211124012662
+    },
+    "rgb+ir": {
+      "n": 4,
+      "acc@0.25": 0.5,
+      "acc@0.5": 0.25,
+      "acc@0.75": 0.25,
+      "mean_iou": 0.36835035785259523,
+      "median_iou": 0.335627534253969
+    },
+    "rgb+depth": {
+      "n": 4,
+      "acc@0.25": 0.5,
+      "acc@0.5": 0.25,
+      "acc@0.75": 0.25,
+      "mean_iou": 0.37053848811698586,
+      "median_iou": 0.33654276771373154
+    },
+    "rgb+ir+depth": {
+      "n": 4,
+      "acc@0.25": 0.5,
+      "acc@0.5": 0.25,
+      "acc@0.75": 0.25,
+      "mean_iou": 0.3683306695415471,
+      "median_iou": 0.3353201525601704
+    }
+  },
+  "eval_gate_stats": {
+    "gate_rgb_mean/l0": 0.7958309650421143,
+    "gate_ir_mean/l0": 0.13633215427398682,
+    "gate_depth_mean/l0": 0.06783685833215714,
+    "aux_ir_ratio/l0": 0.1590578407049179,
+    "aux_depth_ratio/l0": 0.07427645474672318,
+    "gate_rgb_mean/l1": 0.8235188722610474,
+    "gate_ir_mean/l1": 0.07610636204481125,
+    "gate_depth_mean/l1": 0.10037475824356079,
+    "aux_ir_ratio/l1": 0.08622980862855911,
+    "aux_depth_ratio/l1": 0.11414050310850143,
+    "gate_rgb_mean/l2": 0.7777066230773926,
+    "gate_ir_mean/l2": 0.09432459622621536,
+    "gate_depth_mean/l2": 0.12796880304813385,
+    "aux_ir_ratio/l2": 0.11291249841451645,
+    "aux_depth_ratio/l2": 0.15741728246212006,
+    "gate_rgb_mean": 0.7990187406539917,
+    "gate_ir_mean": 0.10225436836481094,
+    "gate_depth_mean": 0.0987268015742302,
+    "aux_ir_ratio": 0.1194000393152237,
+    "aux_depth_ratio": 0.11527807265520096
+  },
+  "missing_modality_delta": {
+    "ir": -0.003039478919471428,
+    "depth": -0.0008513486550807969,
+    "both": -0.003059167230519577
+  }
+}
