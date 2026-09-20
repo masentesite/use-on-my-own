@@ -1,13 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""GroundingDINO RGB/IR/Depth 多模态改造的验证测试。
+"""GroundingDINO RGB/IR/Depth 多模态改造的验证测试 —— **第一版 Fusion**。
 
-对应技术方案 §18 的 8 项测试, 另加 1 项参数分组覆盖检查。全部可在 CPU 上跑。
+对应第一版技术方案 §18 的 8 项测试, 另加 1 项参数分组覆盖检查。全部可在 CPU 上跑。
+
+⚠️ 本套件从头到尾围绕 beta 标量写(beta=0 ⇒ 逐位等于 RGB 模型), 所以它是
+**第一版 LanguageGuidedFusion 的套件**, 也是 V2 §11 消融矩阵里 V2-E4
+(residual fusion 对照)的回归测试。配置文件的默认融合已经换成第二版, 因此
+main() 会把 fusion_type 显式盖回 language_guided_residual; 想拿它测第二版请用
+--fusion local_cross_attention_spatial_gate(多半会挂, 见 test_v2_fusion.py)。
 
 用法(在仓库根目录执行):
     .venv/bin/python test_multimodal.py --device cpu
     .venv/bin/python test_multimodal.py --device cpu --weights weights/groundingdino_swint_ogc.pth
     .venv/bin/python test_multimodal.py --device cuda --weights weights/groundingdino_swint_ogc.pth
+
+第二版(局部 cross-attention + 空间矩阵 gate)的测试在 test_v2_fusion.py。
 
 不传 --weights 时: 辅助测试用随机初始化, 而「RGB-only 回归」测试改为把多模态模型里
 RGB 子树的权重直接拷进一个原始 config 构建的模型再比对 —— 不需要 checkpoint 也能验证
@@ -78,10 +86,18 @@ def check(cond, msg):
         raise Failure(msg)
 
 
-def build(cfg_path, weights=None, device="cpu"):
-    """按 config 建模型; weights 给了就加载 checkpoint(走 clean_state_dict + strict=False)。"""
+def build(cfg_path, weights=None, device="cpu", fusion_type=None):
+    """按 config 建模型; weights 给了就加载 checkpoint(走 clean_state_dict + strict=False)。
+
+    fusion_type 不为 None 时覆盖 config 里的值 —— 本文件是**第一版**
+    LanguageGuidedFusion 的测试套件(beta 语义贯穿全部 11 项), 而 config 的默认
+    融合已经换成第二版, 所以要显式盖回 v1 才能跑。第二版有自己的
+    test_v2_fusion.py。RGB_CFG 没有 use_multimodal, 不受影响。
+    """
     args = SLConfig.fromfile(cfg_path)
     args.device = device
+    if fusion_type is not None and getattr(args, "use_multimodal", False):
+        args.fusion_type = fusion_type
     model = build_model(args)
     info = {}
     if weights:
@@ -1043,6 +1059,11 @@ def main():
                     help="GroundingDINO checkpoint; 不传则用 state_dict 拷贝做 RGB 回归")
     ap.add_argument("--only", default=None, help="只跑名字里含该子串的测试")
     ap.add_argument("--image", default=SAMPLE_IMAGE)
+    ap.add_argument("--fusion", default="language_guided_residual",
+                    choices=["language_guided_residual",
+                             "local_cross_attention_spatial_gate"],
+                    help="要测哪一版 Fusion。本套件是按第一版(beta 残差)的语义写的, "
+                         "默认测第一版; 第二版的测试在 test_v2_fusion.py")
     args = ap.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -1051,11 +1072,12 @@ def main():
 
     print("=" * 78)
     print(f"device={args.device}  weights={args.weights or '(无, 用 state_dict 拷贝)'}")
+    print(f"fusion={args.fusion}")
     print(f"sample={args.image}")
     print("=" * 78)
 
     _, image = load_image(args.image)
-    mm, info = build(MM_CFG, args.weights, args.device)
+    mm, info = build(MM_CFG, args.weights, args.device, fusion_type=args.fusion)
     if args.weights:
         warm = getattr(mm, "_ir_warm_start_info", None)
         print(f"IR Swin warm-start: {warm}")

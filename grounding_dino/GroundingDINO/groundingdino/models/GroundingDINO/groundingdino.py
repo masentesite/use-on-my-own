@@ -45,6 +45,7 @@ from .bertwarper import (
     generate_masks_with_special_tokens_and_transfer_map,
 )
 from .multimodal_modules import (
+    CrossAttentionGatedFusion,
     DepthEncoder,
     DepthPreprocessor,
     IREncoder,
@@ -119,9 +120,19 @@ class GroundingDINO(nn.Module):
         depth_high_percentile=99.0,
         depth_grad_scale=8.0,
         depth_hole_ratio=0.25,
+        # "language_guided_residual"            = 第一版(标量 beta 残差), 保留作消融
+        # "local_cross_attention_spatial_gate"  = 第二版主方案(V2 §5)
         fusion_type="language_guided_residual",
         fusion_beta_init=0.0,
         fusion_gate_bias=-2.0,
+        # ---- 第二版 fusion 专属 (V2 §6) ----
+        fusion_window_size=5,
+        fusion_num_heads=8,
+        fusion_gate_type="spatial_softmax",
+        fusion_gate_rgb_bias=2.0,
+        fusion_gate_aux_bias=0.0,
+        fusion_gate_use_text=True,
+        fusion_log_stats=True,
         adapter_dim=64,
         modality_dropout_ir=0.0,
         modality_dropout_depth=0.0,
@@ -221,6 +232,10 @@ class GroundingDINO(nn.Module):
         self.ir_proj = None
         self.depth_proj = None
         self.fusion = None
+        self.fusion_type = None
+        # 最近一次 forward 的 gate / beta 诊断量(V2 §9)。None 表示这次 forward 走的
+        # 是纯 RGB 路径(没有辅助模态), 训练脚本据此跳过日志。
+        self._fusion_stats = None
         # Fusion 只作用于 backbone 实际输出的 level 数(本配置是 3:H/8、H/16、H/32)。
         # 第 4 个 level(H/64)按方案 §5 由 input_proj 从原始 RGB 特征下采样得到, 不参与融合。
         self.num_fusion_levels = len(backbone.num_channels)
@@ -229,8 +244,6 @@ class GroundingDINO(nn.Module):
         )
 
         if use_multimodal:
-            assert fusion_type == "language_guided_residual", f"未知 fusion_type {fusion_type!r}"
-
             if ir_encoder_type == "swin_t_warm_start":
                 self.ir_encoder = IREncoder(
                     modelname=ir_backbone,
@@ -259,14 +272,38 @@ class GroundingDINO(nn.Module):
             self.ir_proj = MultiScaleProjection(self.ir_encoder.out_channels, hidden_dim)
             self.depth_proj = MultiScaleProjection(self.depth_encoder.out_channels, hidden_dim)
 
-            self.fusion = LanguageGuidedFusion(
-                dim=hidden_dim,
-                num_levels=self.num_fusion_levels,
-                text_dim=hidden_dim,
-                adapter_dim=adapter_dim,
-                gate_bias=fusion_gate_bias,
-                beta_init=fusion_beta_init,
-            )
+            # 两版 Fusion 二选一(V2 §7.2)。接口完全一致: forward(rgb_srcs,
+            # ir_srcs=, depth_srcs=, text_dict=, ir_valid=, depth_valid=) -> List[Tensor],
+            # 所以 _fuse_multimodal 与冻结/分组学习率逻辑都不需要按版本分支。
+            if fusion_type == "language_guided_residual":
+                self.fusion = LanguageGuidedFusion(
+                    dim=hidden_dim,
+                    num_levels=self.num_fusion_levels,
+                    text_dim=hidden_dim,
+                    adapter_dim=adapter_dim,
+                    gate_bias=fusion_gate_bias,
+                    beta_init=fusion_beta_init,
+                )
+            elif fusion_type == "local_cross_attention_spatial_gate":
+                self.fusion = CrossAttentionGatedFusion(
+                    dim=hidden_dim,
+                    num_levels=self.num_fusion_levels,
+                    text_dim=hidden_dim,
+                    adapter_dim=adapter_dim,
+                    num_heads=fusion_num_heads,
+                    window_size=fusion_window_size,
+                    gate_type=fusion_gate_type,
+                    gate_rgb_bias=fusion_gate_rgb_bias,
+                    gate_aux_bias=fusion_gate_aux_bias,
+                    gate_use_text=fusion_gate_use_text,
+                    log_stats=fusion_log_stats,
+                )
+            else:
+                raise ValueError(
+                    f"未知 fusion_type {fusion_type!r}; 可选 "
+                    "'language_guided_residual' / 'local_cross_attention_spatial_gate'"
+                )
+            self.fusion_type = fusion_type
 
             self.modality_augment = ModalityAugment(
                 p_ir_drop=modality_dropout_ir,
@@ -452,6 +489,7 @@ class GroundingDINO(nn.Module):
         ir, ir_mask, ir_valid = self._aux_modality(kw, "ir_samples", "ir_valid", samples)
         depth, _, depth_valid = self._aux_modality(kw, "depth_samples", "depth_valid", samples)
         if ir is None and depth is None:
+            self._fusion_stats = None
             return srcs
 
         # 训练期的模态 dropout / 退火增强 (方案 §14)。eval 下是恒等变换。
@@ -466,12 +504,13 @@ class GroundingDINO(nn.Module):
         if ir is None and depth is None:
             # 整 batch 都被 modality dropout 掉了: 这一支走的就是「辅助模态缺失」的
             # 纯 RGB 路径, 与上游完全一致, 同时也省下一次辅助编码器的前向。
+            self._fusion_stats = None
             return srcs
 
         ir_srcs = self._encode_ir(ir, ir_mask) if ir is not None else None
         depth_srcs = self._encode_depth(depth, depth_valid) if depth is not None else None
 
-        return self.fusion(
+        fused = self.fusion(
             srcs,
             ir_srcs=ir_srcs,
             depth_srcs=depth_srcs,
@@ -479,6 +518,10 @@ class GroundingDINO(nn.Module):
             ir_valid=ir_valid,
             depth_valid=depth_valid,
         )
+        # 第二版 Fusion 会顺手算出 gate 分布与 aux/RGB 强度比(V2 §9); 第一版只有
+        # beta。两种 fusion 都走 last_stats 这一个约定, 训练脚本不必按版本分支。
+        self._fusion_stats = getattr(self.fusion, "last_stats", None)
+        return fused
 
     # ==================================================================
     #  IR Swin 的 warm-start (方案 §6 方案 A)
@@ -969,6 +1012,13 @@ def build_groundingdino(args):
         fusion_type=getattr(args, "fusion_type", "language_guided_residual"),
         fusion_beta_init=getattr(args, "fusion_beta_init", 0.0),
         fusion_gate_bias=getattr(args, "fusion_gate_bias", -2.0),
+        fusion_window_size=getattr(args, "fusion_window_size", 5),
+        fusion_num_heads=getattr(args, "fusion_num_heads", 8),
+        fusion_gate_type=getattr(args, "fusion_gate_type", "spatial_softmax"),
+        fusion_gate_rgb_bias=getattr(args, "fusion_gate_rgb_bias", 2.0),
+        fusion_gate_aux_bias=getattr(args, "fusion_gate_aux_bias", 0.0),
+        fusion_gate_use_text=getattr(args, "fusion_gate_use_text", True),
+        fusion_log_stats=getattr(args, "fusion_log_stats", True),
         adapter_dim=getattr(args, "adapter_dim", 64),
         modality_dropout_ir=getattr(args, "modality_dropout_ir", 0.0),
         modality_dropout_depth=getattr(args, "modality_dropout_depth", 0.0),

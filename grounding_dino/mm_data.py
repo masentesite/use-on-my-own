@@ -53,6 +53,17 @@ IR_MEAN = float(np.mean(IMAGENET_MEAN))  # 0.449
 IR_STD = float(np.mean(IMAGENET_STD))    # 0.226
 
 
+def normalize_caption(query: str) -> str:
+    """指代句的规范化:小写 + 去首尾空白 + 补结尾句号。
+
+    **单一事实来源** —— dataset 与推理脚本(run_grounding_mm.py)都走这里。
+    尾句号不能省:它决定 tokenizer 的 [SEP] 落在哪一位, 而打分取的正是
+    `arange(1, n_tok-1)` 这段真实词 token 上的最大值, 少一个句号就整体错位一格。
+    """
+    s = query.lower().strip()
+    return s if s.endswith(".") else s + "."
+
+
 # ================================================================ 划分
 
 def load_items(data_dir: str):
@@ -193,9 +204,7 @@ class MultiModalReferDataset(Dataset):
             # 水平镜像: cx' = 1 - cx; w/h 不变
             boxes[:, 0] = 1.0 - boxes[:, 0]
 
-        caption = it["query"].lower().strip()
-        if not caption.endswith("."):
-            caption = caption + "."
+        caption = normalize_caption(it["query"])
 
         return {
             "image": img_t,      # [3,h,w]  已归一化

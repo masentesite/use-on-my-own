@@ -87,14 +87,42 @@ depth_high_percentile = 99.0
 depth_grad_scale = 8.0
 depth_hole_ratio = 0.25
 
-# ====================== Fusion (方案 §9) ======================
-fusion_type = "language_guided_residual"
-# 输出侧零初始化: beta=0 + Adapter 末层为 0, 训练起点上 F_new == F_rgb
-fusion_zero_init = True
+# ====================== Fusion (方案 §9 / V2 §5) ======================
+# 两版 Fusion 二选一, 接口完全一致(见 groundingdino.py 的 _fuse_multimodal):
+#   "local_cross_attention_spatial_gate"  第二版主方案: 局部 cross-attention 候选
+#                                         + B x 3 x H x W 空间矩阵 gate
+#   "language_guided_residual"            第一版: beta 标量控制的残差注入
+#                                         (V2 §11 消融矩阵的 V2-E4 用它做对照)
+fusion_type = "local_cross_attention_spatial_gate"
+
+# ---- 第二版专属 (V2 §6 §14) ----
+# 局部 cross-attention 的窗口边长。配准良好时 3 就够; 有轻微错位用 5(默认)。
+# 边界定位差就往上调(§12「边界定位差」一行)。
+fusion_window_size = 5
+# 与 hidden_dim=256 对齐, 每头 32 维
+fusion_num_heads = 8
+# 只有 spatial_softmax 一种实现: 输出 B x 3 x H x W, 通道依次是
+# RGB / IR-attended / Depth-attended
+fusion_gate_type = "spatial_softmax"
+# gate bias 初值 [rgb, ir, depth]。softmax([2,0,0]) = [0.786, 0.107, 0.107]。
+# ⚠️ 第二版**不再**零初始化: 辅助模态从第一步就拿到非零权重入口(V2 §5.3)。
+# 性能比 RGB 明显下降时先上调到 3.0(softmax -> [0.91, 0.045, 0.045]), 更保守。
+fusion_gate_rgb_bias = 2.0
+fusion_gate_aux_bias = 0.0
+# gate 的输入是否包含句子级文本向量 T_global 的广播
+fusion_gate_use_text = True
+# 记录 gate_rgb_mean / gate_ir_mean / gate_depth_mean / aux_ir_ratio / aux_depth_ratio
+# (V2 §9)。这是判断「辅助模态是否真的被用上」的唯一依据, 不要关。
+fusion_log_stats = True
+
+# ---- 第一版专属(改回 fusion_type="language_guided_residual" 时才生效) ----
+# 输出侧零初始化: beta=0 + Adapter 末层为 0, 训练起点上 F_new == F_rgb。
+# 注意这个开关对第二版**不适用**, 第二版靠 gate bias 而非零初始化。
+fusion_zero_init = False
 # 每个 level 一个可学习标量 beta 的初值。0 时模型严格等于 RGB 模型;
 # 若发现辅助支路起步太慢可改成 1e-3。
 fusion_beta_init = 0.0
-# 空间 gate 的 bias 初值, sigmoid(-2) ≈ 0.12, 避免一开始门控过强
+# 第一版空间 gate(sigmoid)的 bias 初值, sigmoid(-2) ≈ 0.12
 fusion_gate_bias = -2.0
 
 # ====================== Adapter (方案 §10) ======================

@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """多模态 GroundingDINO 微调入口 —— 同一份代码既跑本地冒烟测试, 也跑云端 4090 训练。
 
+分层(2026-09-20 从 `main()` 里拆出来, 逻辑一字未改):
+
+    train_multimodal(opt)  ->  dict      一次完整运行: 数据/模型/优化器/循环/验证/存档/summary
+      ├─ train_one_epoch(...)            一个 epoch 的三模态训练循环
+      └─ validate_and_checkpoint(...)    四种模态组合各评一遍 + 按 mean_iou 存 best.pth
+    main(argv)                          只做「解析参数 -> 冒烟覆盖 -> 调 train_multimodal」
+
+想编程调用(比如 §11 的消融矩阵 V2-E0..E6 要跑七次, 每次只改 fusion_type):
+
+    from train_multimodal import parse_args, apply_smoke, train_multimodal
+    opt = apply_smoke(parse_args([]))          # 或 parse_args(["--stage", "1", ...])
+    opt.out_dir = "runs/ablation/E3"
+    result = train_multimodal(opt)
+    result["missing_modality_delta"]           # §9 的辅助模态增益, 直接读, 不用解析 JSON
+
 设计要点:
 
 * **一条命令一个 stage。** `--stage N` 决定冻结策略, `--resume` 从上一段的 checkpoint 续。
@@ -19,6 +34,7 @@ import argparse
 import json
 import math
 import os
+import random
 import socket
 import sys
 import time
@@ -164,9 +180,24 @@ def build_and_load(opt):
 
     if opt.resume:
         ckpt = torch.load(opt.resume, map_location="cpu", weights_only=False)
+        # ---- 版本守卫: 两版 Fusion 的 state_dict 键完全不同 ----
+        # 第一版是 beta_ir / beta_depth + gate/delta conv, 第二版是 ir_attn /
+        # depth_attn / gate.conv。拿 v1 的 checkpoint 去 strict 加载 v2 模型会抛一堆
+        # missing/unexpected; 若有人为了「先跑起来」把 strict 关掉, 就会在**随机初始化
+        # 的 Fusion** 上继续训练 —— 那正好会表现为 §12 的「辅助模态仍然没贡献」,
+        # 却极难查。V2 §11 的消融矩阵里 V2-E3(v2)与 V2-E4(v1)本来就要各训一份,
+        # 混淆的机会很大, 所以这里显式拦住。
+        want, got = model.fusion_type, ckpt.get("fusion_type")
+        if got is not None and got != want:
+            raise SystemExit(
+                f"[ckpt] 融合版本不匹配: {opt.resume} 是 {got!r} 训出来的, "
+                f"当前 config 是 {want!r}。改 --config 或换 checkpoint; "
+                f"直接加载会在错误的 Fusion 上继续训练。"
+            )
         model.load_state_dict(ckpt["model"])
         print(f"[ckpt] 已从 {opt.resume} 恢复 (stage={ckpt.get('stage')}, "
-              f"epoch={ckpt.get('epoch')}, step={ckpt.get('global_step')})")
+              f"epoch={ckpt.get('epoch')}, step={ckpt.get('global_step')}, "
+              f"fusion={got or '未记录(旧 checkpoint)'})")
         return model, ckpt
 
     if opt.weights and os.path.exists(opt.weights):
@@ -241,58 +272,156 @@ def iou_xyxy(a, b):
     return inter / union if union > 0 else 0.0
 
 
+# 评估的四种输入组合 (V2 §7.4 第 3 条)。名字 -> (是否给 IR, 是否给 Depth)。
+# 只给一个辅助模态时, 另一个模态在模型侧走的就是「该模态缺失」的路径:
+# _fuse_multimodal 收到 ir_samples=None 或 depth_samples=None, Fusion 用同一套
+# 三通道 gate, 把缺失那一路的 logit 置 -1e4。
+MODALITY_COMBOS = (
+    ("rgb", False, False),
+    ("rgb+ir", True, False),
+    ("rgb+depth", False, True),
+    ("rgb+ir+depth", True, True),
+)
+
+
+def _merge_stats(acc, stats):
+    """把一次 forward 的 last_stats 累加进 acc(张量求和 + 计数, 不做 .item())。
+
+    ⚠️ 刻意不在循环里 .item(): 那会在每个 batch 上强制一次 device 同步,
+    训练时是纯粹的流水线停顿。累加的是 detached 张量, 只在最终打印时才同步一次。
+    """
+    if not stats:
+        return
+    for k, v in stats.items():
+        slot = acc.get(k)
+        if slot is None:
+            acc[k] = [v.detach().clone().float(), 1]
+        else:
+            slot[0] += v.detach().float()
+            slot[1] += 1
+
+
+def _stats_to_float(acc):
+    return {k: float(v / n) for k, (v, n) in acc.items() if n}
+
+
+def gate_stats_line(stats, keys=("gate_rgb_mean", "gate_ir_mean", "gate_depth_mean",
+                                 "aux_ir_ratio", "aux_depth_ratio")):
+    """把跨 level 平均后的 gate 诊断量拼成一行日志(V2 §9)。
+
+    第一版 Fusion 的 last_stats 里没有这些键, 只有逐 level 的 beta_ir/beta_depth,
+    所以挑不到就整体退化成逐键打印 —— 两版融合共用同一段打印代码。
+    """
+    parts = [f"{k}={stats[k]:.3f}" for k in keys if k in stats]
+    if not parts:
+        parts = [f"{k}={stats[k]:.4f}" for k in sorted(stats)]
+    return " ".join(parts)
+
+
 @torch.no_grad()
-def evaluate(model, loader, opt, max_items=0):
+def evaluate(model, loader, opt, max_items=0, combos=MODALITY_COMBOS):
     """复刻 run_grounding.py 的 top-1 指代协议, 只是输入换成三模态。
 
     打分口径逐字对齐: pred_logits 先 sigmoid(**模型输出的已经是 logits**),
     取真实 token 位置 arange(1, n_tok-1)(即排除 [CLS]/[SEP])的最大值作为该框的分数。
+
+    V2 §7.4 第 3 条要求同时保存 RGB / RGB+IR / RGB+Depth / RGB+IR+Depth 四种结果 ——
+    §9 最后一行「missing modality delta」就是靠这四个数的差来读的: 如果
+    RGB+IR+Depth 与 RGB-only 的 mean_iou 差不到噪声量级, 说明辅助模态贡献不足。
+
+    Returns:
+        dict, 顶层保留 mean_iou(= 三模态那一档, 与改动前的口径一致, best.pth
+        的判据不变), 另加:
+            "per_combo": {组合名: 指标 dict}
+            "gate_stats": {指标名: float}, 来自 Fusion 的 last_stats, **只统计三模态
+                那一档** —— 另外两档必然有通道恒为 0, 混进来会把这个读数稀释掉,
+                没法跟训练日志的 [gate] 行对照(原因见下面累加处的注释)。
     """
     model.eval()
-    ious = []
-    n = 0
-    for samples, targets, ir, depth in loader:
-        samples = samples.to(opt.device)
-        ir, depth = ir.to(opt.device), depth.to(opt.device)
-        captions = [t["caption"] for t in targets]
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=opt.amp):
-            # 不传 targets -> 走推理路径(out 里不会有 aux_outputs / text_token_mask),
-            # 与 run_grounding.py 的调用方式一致; captions 得显式给。
-            outputs = model(samples, captions=captions, ir_samples=ir, depth_samples=depth)
+    stats_acc = {}
+    per_combo = {}
 
-        logits = outputs["pred_logits"].float().sigmoid()   # [B,nq,T]
-        boxes = outputs["pred_boxes"].float()               # [B,nq,4] 归一化 cxcywh
+    for name, use_ir, use_depth in combos:
+        ious = []
+        n = 0
+        for samples, targets, ir, depth in loader:
+            samples = samples.to(opt.device)
+            ir, depth = ir.to(opt.device), depth.to(opt.device)
+            captions = [t["caption"] for t in targets]
+            kw = {}
+            if use_ir:
+                kw["ir_samples"] = ir
+            if use_depth:
+                kw["depth_samples"] = depth
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=opt.amp):
+                # 不传 targets -> 走推理路径(out 里不会有 aux_outputs / text_token_mask),
+                # 与 run_grounding.py 的调用方式一致; captions 得显式给。
+                outputs = model(samples, captions=captions, **kw)
+            # ---- gate 诊断量只取**三模态那一档**, 不能四档混在一起累加 ----
+            # §9 的判据是拿这个读数跟训练日志里的 [gate] 行对着看的, 而训练时
+            # 每个样本都带全三路。若把四档混起来, 缺辅助模态的那两档会往对应通道
+            # 里塞进精确的 0(gate_depth_mean 在 RGB+IR 档恒为 0), gate_ir_mean /
+            # gate_depth_mean 就会被稀释到真值的 ~2/3, 而 gate_rgb_mean 被抬到
+            # (0.88+0.88+0.79)/3≈0.85 —— 同一个模型, eval 读出 0.094 而训练读出
+            # 0.108, 会让人误判「辅助模态在验证集上变弱了」。三模态档是唯一
+            # 五个指标同时有意义的档, 所以只累加它; 其余三档的指标在 per_combo 里。
+            if use_ir and use_depth:
+                _merge_stats(stats_acc, getattr(model, "_fusion_stats", None))
 
-        for i, t in enumerate(targets):
-            caption = t["caption"]
-            n_tok = model.tokenizer(caption, return_tensors="pt")["input_ids"].shape[1]
-            valid_pos = torch.arange(1, max(1, n_tok - 1))
-            scores = logits[i][:, valid_pos].max(dim=1)[0]  # [nq]
-            q = int(scores.argmax().item())
-            cx, cy, w, h = boxes[i][q].tolist()
-            pred = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+            logits = outputs["pred_logits"].float().sigmoid()   # [B,nq,T]
+            boxes = outputs["pred_boxes"].float()               # [B,nq,4] 归一化 cxcywh
 
-            gt_cxcywh = t["boxes"][0].tolist()              # [1,4] 归一化 cxcywh
-            gx, gy, gw, gh = gt_cxcywh
-            gt = [gx - gw / 2, gy - gh / 2, gx + gw / 2, gy + gh / 2]
-            ious.append(iou_xyxy(pred, gt))
+            for i, t in enumerate(targets):
+                caption = t["caption"]
+                n_tok = model.tokenizer(caption, return_tensors="pt")["input_ids"].shape[1]
+                valid_pos = torch.arange(1, max(1, n_tok - 1))
+                scores = logits[i][:, valid_pos].max(dim=1)[0]  # [nq]
+                q = int(scores.argmax().item())
+                cx, cy, w, h = boxes[i][q].tolist()
+                pred = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
 
-            n += 1
+                gt_cxcywh = t["boxes"][0].tolist()              # [1,4] 归一化 cxcywh
+                gx, gy, gw, gh = gt_cxcywh
+                gt = [gx - gw / 2, gy - gh / 2, gx + gw / 2, gy + gh / 2]
+                ious.append(iou_xyxy(pred, gt))
+
+                n += 1
+                if max_items and n >= max_items:
+                    break
             if max_items and n >= max_items:
                 break
-        if max_items and n >= max_items:
-            break
+
+        arr = np.array(ious) if ious else np.zeros(1)
+        per_combo[name] = {
+            "n": len(ious),
+            "acc@0.25": float((arr >= 0.25).mean()),
+            "acc@0.5": float((arr >= 0.5).mean()),
+            "acc@0.75": float((arr >= 0.75).mean()),
+            "mean_iou": float(arr.mean()),
+            "median_iou": float(np.median(arr)),
+        }
 
     model.train()
-    arr = np.array(ious) if ious else np.zeros(1)
-    return {
-        "n": len(ious),
-        "acc@0.25": float((arr >= 0.25).mean()),
-        "acc@0.5": float((arr >= 0.5).mean()),
-        "acc@0.75": float((arr >= 0.75).mean()),
-        "mean_iou": float(arr.mean()),
-        "median_iou": float(np.median(arr)),
-    }
+
+    def miou(name):
+        return per_combo[name]["mean_iou"] if name in per_combo else None
+
+    # 顶层保留改动前的口径: 三模态全给那一档, best.pth 的判据因此不变
+    main = combos[-1][0]
+    out = dict(per_combo[main])
+    out["per_combo"] = per_combo
+    out["gate_stats"] = _stats_to_float(stats_acc)
+    # §9 最后一行: 辅助模态相对 RGB-only 的实际增益。差值为负说明融合在拖后腿。
+    base = miou("rgb")
+    delta = {}
+    if base is not None:
+        for label, name in (("ir", "rgb+ir"), ("depth", "rgb+depth"),
+                            ("both", "rgb+ir+depth")):
+            v = miou(name)
+            if v is not None:
+                delta[label] = v - base
+    out["missing_modality_delta"] = delta
+    return out
 
 
 # ================================================================ checkpoint
@@ -308,6 +437,9 @@ def save_ckpt(path, model, optimizer, scaler, epoch, global_step, opt, split,
             "epoch": epoch,
             "global_step": global_step,
             "stage": opt.stage,
+            # 记下融合版本: 第一版与第二版的 Fusion 键完全不同, 而 §11 的消融矩阵
+            # 要求各训一份。没有这一项就只能靠猜, 见 build_and_load 里的版本守卫。
+            "fusion_type": getattr(model, "fusion_type", None),
             # 见 main 里「best_metric 继承」那段: 续训同一个 stage 时不能让 best.pth 被倒退覆盖
             "best_metric": best_metric,
             "args": vars(opt),
@@ -318,15 +450,149 @@ def save_ckpt(path, model, optimizer, scaler, epoch, global_step, opt, split,
     )
 
 
-# ================================================================ 主流程
+# ================================================================ 训练
 
-def main(argv=None):
-    opt = parse_args(argv)
-    if opt.smoke:
-        opt = apply_smoke(opt)
+def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler, opt,
+                    epoch, global_step, iters_per_epoch):
+    """跑**一个 epoch**, 返回 (各 loss 的均值字典, 本 epoch 的 gate 统计, global_step)。
 
+    这里是三模态训练的核心循环: 每个 batch 都带全三路(`ir_samples` / `depth_samples`),
+    模态 dropout 与融合都在 `model.forward` 内部完成(见 `groundingdino._fuse_multimodal`),
+    循环里不做任何模态层面的分支 —— 四种输入组合是模型自己随机造出来的。
+
+    V2 §9 的 gate 诊断量在这里累加: 累加的是 detached 张量, 只在打印时同步一次
+    (见 `_merge_stats` 的说明)。每个 epoch 重置, 打印的是「本 epoch 至今」的均值。
+    """
+    t0 = time.perf_counter()
+    running, n_run = {}, 0
+    gate_acc = {}
+    optimizer.zero_grad(set_to_none=True)
+
+    for it, (samples, targets, ir, depth) in enumerate(loader):
+        if opt.max_steps and it >= opt.max_steps:
+            break
+        # NestedTensor.to() 不接受 non_blocking 参数(它是 namedtuple 的自定义实现)
+        samples = samples.to(opt.device)
+        ir = ir.to(opt.device, non_blocking=True)
+        depth = depth.to(opt.device, non_blocking=True)
+        targets = [
+            {"caption": t["caption"], "boxes": t["boxes"].to(opt.device)}
+            for t in targets
+        ]
+
+        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=opt.amp):
+            # captions 由 forward 自己从 targets 里取, 不要再传 captions=
+            out = model(samples, targets, ir_samples=ir, depth_samples=depth)
+        # criterion 在 autocast 之外调用, 内部再把张量转 fp32(见 mm_loss.py)
+        loss_dict = criterion(out, targets)
+        loss = sum(loss_dict.values()) / opt.grad_accum
+
+        scaler.scale(loss).backward()
+
+        if (it + 1) % opt.grad_accum == 0:
+            if opt.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(
+                    [p for g in optimizer.param_groups for p in g["params"]],
+                    opt.grad_clip,
+                )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            if scheduler:
+                scheduler.step()
+            global_step += 1
+
+        with torch.no_grad():
+            for k, v in loss_dict.items():
+                running[k] = running.get(k, 0.0) + float(v.item())
+        # Fusion 在 forward 里顺手算好的 gate 分布 / aux-RGB 强度比(V2 §9)。
+        # 纯 RGB 的那几步(整批被 modality dropout 掉)是 None, 自动跳过。
+        _merge_stats(gate_acc, getattr(model, "_fusion_stats", None))
+        n_run += 1
+
+        if opt.print_freq and (it + 1) % opt.print_freq == 0:
+            cur_lr = optimizer.param_groups[0]["lr"]
+            avg_ce = running.get("loss_ce", 0.0) / n_run
+            print(f"  e{epoch} [{it + 1}/{iters_per_epoch}] "
+                  f"ce={avg_ce:.4f} lr={cur_lr:.2e} "
+                  f"({time.perf_counter() - t0:.0f}s)", flush=True)
+            # §9 的判据: gate_rgb_mean 长期贴近 1 = 模型仍只走 RGB;
+            # gate_ir_mean / gate_depth_mean 长期贴近 0 = 该模态没被用上。
+            line = gate_stats_line(_stats_to_float(gate_acc))
+            if line:
+                print(f"       [gate] {line}", flush=True)
+
+    dt = time.perf_counter() - t0
+    avg = {k: v / max(1, n_run) for k, v in running.items()}
+    head = " ".join(f"{k}={v:.4f}" for k, v in list(avg.items())[:3])
+    print(f"[epoch {epoch}] {n_run} iters, {dt:.0f}s, {head}", flush=True)
+    gate_stats = _stats_to_float(gate_acc)
+    line = gate_stats_line(gate_stats)
+    if line:
+        print(f"[gate  {epoch}] {line}", flush=True)
+    return avg, gate_stats, global_step
+
+
+def validate_and_checkpoint(model, val_loader, optimizer, scaler, opt, epoch,
+                            global_step, split, best_metric):
+    """验证 + 存档, 返回 (metrics 或 None, 更新后的 best_metric)。
+
+    验证按 V2 §7.4 第 3 条把四种模态组合各跑一遍 —— §9 最后一行「missing modality
+    delta」就是靠这四个数的差来读的。`metrics is None` 表示这一轮没验证(val_every 没到)。
+
+    注意 `evaluate()` 自己会在开头 `model.eval()`、结尾 `model.train()` 复原模式,
+    所以训练侧**不需要**在验证后手动切回 train。
+    """
+    metrics = None
+    if opt.val_every and (epoch + 1) % opt.val_every == 0 and len(val_loader.dataset):
+        metrics = evaluate(model, val_loader, opt, max_items=opt.val_max)
+        for combo, m in metrics["per_combo"].items():
+            print(f"[val   {epoch}] {combo:<14} n={m['n']} "
+                  f"Acc@0.25={m['acc@0.25']:.4f} Acc@0.5={m['acc@0.5']:.4f} "
+                  f"Acc@0.75={m['acc@0.75']:.4f} meanIoU={m['mean_iou']:.4f}")
+        d = metrics.get("missing_modality_delta") or {}
+        if d:
+            # §9「missing modality delta」: 差值过小说明辅助模态贡献不足
+            print("[val   {0}] delta vs rgb-only: ".format(epoch)
+                  + " ".join(f"{k}={v:+.4f}" for k, v in d.items()))
+        line = gate_stats_line(metrics.get("gate_stats") or {})
+        if line:
+            print(f"[val   {epoch}] [gate] {line}", flush=True)
+
+    # ---- 存档 ----
+    if opt.save_every and (epoch + 1) % opt.save_every == 0:
+        save_ckpt(os.path.join(opt.out_dir, "last.pth"),
+                  model, optimizer, scaler, epoch + 1, global_step, opt, split,
+                  best_metric=best_metric)
+    if metrics is not None:
+        cur = metrics["mean_iou"]
+        if cur > best_metric:
+            best_metric = cur
+            save_ckpt(os.path.join(opt.out_dir, "best.pth"),
+                      model, optimizer, scaler, epoch + 1, global_step, opt, split,
+                      best_metric=best_metric)
+            print(f"[save  {epoch}] best.pth (meanIoU={cur:.4f})")
+    return metrics, best_metric
+
+
+def train_multimodal(opt):
+    """三模态(RGB + IR + Depth)微调的**完整一次运行**, 返回 `train_summary.json` 里那份 dict。
+
+    数据、模型、冻结策略、优化器、训练循环、验证、存档、summary 全在这里; `main()` 只是它的
+    命令行外壳。拆成函数是为了让上层能**编程调用**(§11 的消融矩阵 V2-E0..E6 就是七次调用,
+    每次只改 `fusion_type` / 模态开关, 不必解析 JSON、也不必起七个子进程)。
+
+    一条命令一个 stage: `opt.stage` 决定冻结策略, `opt.resume` 从上一段的 checkpoint 续。
+    运行中**不切换 stage** —— 那会让 AdamW 动量在 cosine 中途断档。
+    """
     torch.manual_seed(opt.seed)
     np.random.seed(opt.seed)
+    # ⚠️ 必须也播 stdlib random: `MultiModalReferDataset.__getitem__` 的水平翻转用的是
+    # `random.random()`(见 mm_data.py), 而 torch/np 的种子管不到它。少了这一句, 同一个
+    # --seed 两次运行的几何增强不同 —— 实测同参数冒烟 best_mean_iou 会跑出 0.3069 / 0.3735
+    # 两个值, 冒烟测试「可复现」这条就落空了(apply_smoke 里关 modality_augment 也是为此)。
+    random.seed(opt.seed)
     if opt.device.startswith("cuda") and not torch.cuda.is_available():
         print("[env] ⚠️ CUDA 不可用, 回退到 cpu")
         opt.device = "cpu"
@@ -406,94 +672,48 @@ def main(argv=None):
             print(f"[ckpt] 继承 best_metric={best_metric:.4f} (同 stage 续训)")
     model.train()
 
+    # 循环外先占位: opt.epochs == start_epoch 时一次都不进循环, 收尾那段仍要能读
+    metrics = None
+    epoch_gate_stats = {}
+
     for epoch in range(start_epoch, opt.epochs):
-        t0 = time.perf_counter()
-        running, n_run = {}, 0
-        optimizer.zero_grad(set_to_none=True)
-
-        for it, (samples, targets, ir, depth) in enumerate(train_loader):
-            if opt.max_steps and it >= opt.max_steps:
-                break
-            # NestedTensor.to() 不接受 non_blocking 参数(它是 namedtuple 的自定义实现)
-            samples = samples.to(opt.device)
-            ir = ir.to(opt.device, non_blocking=True)
-            depth = depth.to(opt.device, non_blocking=True)
-            targets = [
-                {"caption": t["caption"], "boxes": t["boxes"].to(opt.device)}
-                for t in targets
-            ]
-
-            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=opt.amp):
-                # captions 由 forward 自己从 targets 里取, 不要再传 captions=
-                out = model(samples, targets, ir_samples=ir, depth_samples=depth)
-            # criterion 在 autocast 之外调用, 内部再把张量转 fp32(见 mm_loss.py)
-            loss_dict = criterion(out, targets)
-            loss = sum(loss_dict.values()) / opt.grad_accum
-
-            scaler.scale(loss).backward()
-
-            if (it + 1) % opt.grad_accum == 0:
-                if opt.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    clip_grad_norm_(
-                        [p for g in optimizer.param_groups for p in g["params"]],
-                        opt.grad_clip,
-                    )
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                if scheduler:
-                    scheduler.step()
-                global_step += 1
-
-            with torch.no_grad():
-                for k, v in loss_dict.items():
-                    running[k] = running.get(k, 0.0) + float(v.item())
-            n_run += 1
-
-            if (it + 1) % opt.print_freq == 0:
-                cur_lr = optimizer.param_groups[0]["lr"]
-                avg = running.get("loss_ce", 0.0) / n_run
-                print(f"  e{epoch} [{it + 1}/{iters_per_epoch}] "
-                      f"ce={avg:.4f} lr={cur_lr:.2e} "
-                      f"({time.perf_counter() - t0:.0f}s)", flush=True)
-
-        dt = time.perf_counter() - t0
-        head = " ".join(f"{k}={v / max(1, n_run):.4f}"
-                        for k, v in list(running.items())[:3])
-        print(f"[epoch {epoch}] {n_run} iters, {dt:.0f}s, {head}", flush=True)
-
-        # ---- 验证 ----
-        metrics = None
-        if opt.val_every and (epoch + 1) % opt.val_every == 0 and len(val_set):
-            metrics = evaluate(model, val_loader, opt, max_items=opt.val_max)
-            print(f"[val   {epoch}] n={metrics['n']} "
-                  f"Acc@0.25={metrics['acc@0.25']:.4f} Acc@0.5={metrics['acc@0.5']:.4f} "
-                  f"Acc@0.75={metrics['acc@0.75']:.4f} meanIoU={metrics['mean_iou']:.4f}")
-
-        # ---- 存档 ----
-        if opt.save_every and (epoch + 1) % opt.save_every == 0:
-            save_ckpt(os.path.join(opt.out_dir, "last.pth"),
-                      model, optimizer, scaler, epoch + 1, global_step, opt, split,
-                      best_metric=best_metric)
-        if metrics is not None:
-            cur = metrics["mean_iou"]
-            if cur > best_metric:
-                best_metric = cur
-                save_ckpt(os.path.join(opt.out_dir, "best.pth"),
-                          model, optimizer, scaler, epoch + 1, global_step, opt, split,
-                          best_metric=best_metric)
-                print(f"[save  {epoch}] best.pth (meanIoU={cur:.4f})")
+        _, epoch_gate_stats, global_step = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, scheduler, opt,
+            epoch, global_step, iters_per_epoch,
+        )
+        metrics, best_metric = validate_and_checkpoint(
+            model, val_loader, optimizer, scaler, opt, epoch, global_step, split,
+            best_metric,
+        )
 
     # ---- 收尾 ----
     save_ckpt(os.path.join(opt.out_dir, "last.pth"),
               model, optimizer, scaler, opt.epochs, global_step, opt, split,
               best_metric=best_metric)
     result = {"stage": opt.stage, "epochs": opt.epochs, "global_step": global_step,
-              "best_mean_iou": best_metric, "out_dir": opt.out_dir}
+              "best_mean_iou": best_metric, "out_dir": opt.out_dir,
+              "fusion_type": getattr(model, "fusion_type", None),
+              # V2 §9: 训练侧的 gate 统计(最后一个 epoch 的均值)
+              "gate_stats": epoch_gate_stats}
+    if metrics is not None:
+        # V2 §7.4 第 2/3 条: 四种模态组合的评估结果 + 该次评估的 gate_stats
+        result["modality_eval"] = metrics["per_combo"]
+        result["eval_gate_stats"] = metrics["gate_stats"]
+        result["missing_modality_delta"] = metrics["missing_modality_delta"]
     with open(os.path.join(opt.out_dir, "train_summary.json"), "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     print(f"\n完成: {result}")
+    return result
+
+
+# ================================================================ 命令行外壳
+
+def main(argv=None):
+    """命令行入口: 解析参数 -> 冒烟覆盖 -> 调 `train_multimodal`。"""
+    opt = parse_args(argv)
+    if opt.smoke:
+        opt = apply_smoke(opt)
+    train_multimodal(opt)
     if opt.smoke:
         print("SMOKE OK")
 
