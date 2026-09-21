@@ -55,13 +55,41 @@ add_rc() {
   if [ "$MODE" = "check" ]; then printf '  (体检模式,不写入) %s\n' "$1"; return; fi
   grep -qF "$1" "$HOME/.bashrc" 2>/dev/null || echo "$1" >> "$HOME/.bashrc"
 }
+# 从 ~/.bashrc 里删掉含指定子串的行 —— 清理历史遗留的错误配置。
+# 必须有这个:add_rc 只做「没有才追加」,配置一旦写错过就会永久留在 .bashrc 里,
+# 光靠改脚本删不掉(旧值仍会被每个新登录 shell 继承)。
+del_rc() {
+  [ "$MODE" = "check" ] && return 0
+  grep -qF "$1" "$HOME/.bashrc" 2>/dev/null || return 0
+  cp "$HOME/.bashrc" "$HOME/.bashrc.bak.$$"
+  grep -vF "$1" "$HOME/.bashrc.bak.$$" > "$HOME/.bashrc"
+  printf '  (已从 .bashrc 清理历史遗留,备份 %s) %s\n' ".bashrc.bak.$$" "$1"
+}
 
 # 脚本自己所在的目录 = 项目目录
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR" || { echo "无法进入 $PROJECT_DIR"; exit 1; }
 
 export PATH="$HOME/.local/bin:$PATH"
-export UV_PYTHON_INSTALL_MIRROR="https://ghproxy.net/https://github.com/astral-sh/python-build-standalone/releases/download"
+
+# ── Python 发行包的下载源(2026-09-21 实测,踩了很久)────────────────────────
+# 这个变量必须设成**官方 github 前缀**。uv 新版默认去 releases.astral.sh 取 CPython,
+# 而这个域名在 AutoDL 实例上无论走不走代理都基本不可用:
+#
+#   同一份资产 cpython-3.10.21+20260901-...install_only_stripped.tar.gz(29,277,841 字节)
+#     releases.astral.sh  经学术代理   393 KB / 40s 卡死(9.8 KB/s);直连 1.0 MB / 40s
+#     github.com          经学术代理   29,277,841 字节完整,3.16s → 9.27 MB/s   ✅
+#     github.com          直连         1.5 MB / 40s 就停(37 KB/s),永远下不完
+#     ghproxy.net         直连         2.0 MB / 50s 截断   ← 旧脚本用的就是这个
+#     gh-proxy.com 直连 24.9 MB/50s 截断;ghfast.top / ghproxy.cc / gh.llkk.cc 全部不通
+#
+# 旧脚本把镜像指向 ghproxy.net,症状是 uv 报
+#   failed to unpack ... error decoding response body / end of file before message length reached
+# (响应体被掐断,解包自然失败)。**而脚本末尾那段错误信息把它误判成 nvcc 版本不匹配**,
+# 排查方向直接带偏 —— 见第 5 步末尾的分诊提示。
+# 实测:设成本值 + 先 source /etc/network_turbo,`uv python install 3.10` 2.96 秒完成。
+# 注意 uv 下载走 http_proxy(第 5 步已 source 学术代理);少了代理这一步只剩 37 KB/s。
+export UV_PYTHON_INSTALL_MIRROR="https://github.com/astral-sh/python-build-standalone/releases/download"
 
 # ============================ 1. 体检 ============================
 say "1/6 环境体检"
@@ -195,7 +223,10 @@ fi
 say "4/6 持久化环境变量到 ~/.bashrc"
 add_rc "export TORCH_CUDA_ARCH_LIST=\"$TORCH_CUDA_ARCH_LIST\""
 add_rc "export MAX_JOBS=$MAX_JOBS"
-add_rc 'export UV_PYTHON_INSTALL_MIRROR="https://ghproxy.net/https://github.com/astral-sh/python-build-standalone/releases/download"'
+# 先删后写。旧脚本把 ghproxy 镜像写进了 ~/.bashrc,而 add_rc 只做「没有才追加」——
+# 光靠它删不掉旧值,于是每个新登录 shell 都会继续继承那个坏镜像。
+del_rc 'UV_PYTHON_INSTALL_MIRROR'
+add_rc "export UV_PYTHON_INSTALL_MIRROR=\"$UV_PYTHON_INSTALL_MIRROR\""
 ok "TORCH_CUDA_ARCH_LIST=\"$TORCH_CUDA_ARCH_LIST\"  MAX_JOBS=$MAX_JOBS"
 
 # ============================ 5. uv sync ============================
@@ -218,7 +249,17 @@ else
   uv sync --frozen --no-build-isolation-package groundingdino
   RC=$?
   echo "  ────────────────────────────────────────────────"
-  [ $RC -eq 0 ] || die "uv sync 失败(退出码 $RC)。上面的 nvcc 版本行若显示不匹配,就是那个问题;报错信息里出现 'CUDA version' / 'mismatch' 同理"
+  if [ $RC -ne 0 ]; then
+    # 分诊而不是一口咬定 CUDA —— 旧版这里只说「就是 nvcc 版本不匹配」,
+    # 结果把下载被掐断的网络错误也归到 CUDA 上,排查方向直接带偏。
+    die "uv sync 失败(退出码 $RC)。按报错内容对号入座,别先怀疑 CUDA:
+       · 'failed to unpack' / 'error decoding response body' / 'end of file before message length reached'
+         → 下载中途被掐断,网络/镜像问题,与 nvcc 无关(见脚本顶部注释)
+       · 'CUDA version' / 'mismatch' / '_check_cuda_version'
+         → 才是 nvcc 与 torch 版本不一致,上面那行 nvcc 版本就是线索
+       · 'No space left on device'
+         → 空间不足:确认项目在 /root/autodl-tmp 下(系统盘仅 30G,装不下 7.4G 的 .venv)"
+  fi
   ok "uv sync 完成"
 fi
 
