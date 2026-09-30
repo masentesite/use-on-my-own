@@ -59,6 +59,8 @@
 #      --check         只体检,不做任何改动
 #      --jobs N        编译 _C 的并行数(默认 4)
 #      --force         已存在的 .venv 也删掉重建
+#      --cuda-home DIR 手动指定 CUDA_HOME(nvcc 的 major 必须等于 12)
+#                      优先级高于自动扫描,用于镜像里的 12.x 装在冷门路径时
 #      --pip-nvcc      没有合适 nvcc 时,尝试用 PyPI 的 nvidia-cuda-nvcc-cu12
 #                      搭一个假 CUDA_HOME(⚠️ 本方案【未经验证】,见第 6 步)
 #      --mirror-tuna URL / --mirror-pytorch URL / --mirror-python URL
@@ -84,6 +86,7 @@ MIRROR_PYTHON="${MIRROR_PYTHON:-https://mirror.nju.edu.cn/github-release/astral-
 
 # ------------------------------ 参数 ------------------------------
 MODE="deploy"; FORCE=0; USE_PIP_NVCC=0; MAX_JOBS="${MAX_JOBS:-4}"; FOREGROUND=0
+CUDA_HOME_ARG=""                 # --cuda-home 指定,优先级最高
 ORIG_ARGS=("$@")
 
 usage() { sed -n '2,/^# ===/p' "$0" | sed '$d' | sed 's/^# \?//'; exit 0; }
@@ -94,6 +97,7 @@ while [ $# -gt 0 ]; do
     --jobs)           MAX_JOBS="$2"; shift ;;
     --force)          FORCE=1 ;;
     --pip-nvcc)       USE_PIP_NVCC=1 ;;
+    --cuda-home)      CUDA_HOME_ARG="$2"; shift ;;
     --mirror-tuna)    MIRROR_TUNA="$2"; shift ;;
     --mirror-pytorch) MIRROR_PYTORCH="$2"; shift ;;
     --mirror-python)  MIRROR_PYTHON="$2"; shift ;;
@@ -332,12 +336,27 @@ nvcc_full() {   # $1 = nvcc 路径 → 打印 x.y
 }
 
 CUDA_ROOT=""
-# 逐个候选看过去,取第一个 major 匹配的
-for _cand in ${CUDA_HOME:+"$CUDA_HOME"} /usr/local/cuda /usr/local/cuda-12 \
-             /usr/local/cuda-12.8 /usr/local/cuda-12.9 /usr/local/cuda-12.6 /usr/local/cuda-12.4; do
+# 逐个候选看过去,取第一个 major 匹配的。
+# ⚠️ 别硬编码版本号。最初这里写死了 /usr/local/cuda-12.8 / -12.9 / -12.6 / -12.4,
+#    镜像里若是别的 12.x(例如 -12.1 / -12.5)就整个扫不到,还会误报
+#    "没有可用的 nvcc",把人骗去装一套根本不需要装的 toolkit。
+#    改成 glob,并覆盖 conda env(conda 装的 cuda-nvcc 就落在 env 根下)。
+_cands=()
+[ -n "${CUDA_HOME_ARG:-}" ] && _cands+=("$CUDA_HOME_ARG")
+[ -n "${CUDA_HOME:-}" ]     && _cands+=("$CUDA_HOME")
+for _g in /usr/local/cuda* /opt/cuda* "${CONDA_PREFIX:-/nonexistent}" \
+          "$HOME"/miniconda3/envs/* "$HOME"/anaconda3/envs/* \
+          /root/miniconda3/envs/* /root/autodl-tmp/conda/envs/*; do
+  [ -d "$_g" ] && _cands+=("$_g")
+done
+
+_seen_list=""
+for _cand in "${_cands[@]}"; do
   [ -x "$_cand/bin/nvcc" ] || continue
+  case "$_seen_list" in *"|$_cand|"*) continue ;; esac     # 去重
+  _seen_list="$_seen_list|$_cand|"
   _m="$(nvcc_major "$_cand/bin/nvcc")"
-  printf '  候选 %-26s nvcc %s\n' "$_cand" "$(nvcc_full "$_cand/bin/nvcc")"
+  printf '  候选 %-36s nvcc %s\n' "$_cand" "$(nvcc_full "$_cand/bin/nvcc")"
   if [ "$_m" = "$TORCH_CUDA_MAJOR" ]; then CUDA_ROOT="$_cand"; break; fi
 done
 
@@ -382,21 +401,36 @@ else
   else
     cat <<EOF
 
-      两条出路:
+      需要一套 major=$TORCH_CUDA_MAJOR 的 CUDA toolkit(nvcc + 头文件)。
 
-      1) 装一个 CUDA 12.x toolkit,让 nvcc 与 torch 的 cu$TORCH_CUDA_MAJOR 同 major。
-         AutoDL 的镜像通常自带 /usr/local/cuda-12.x(交接文档实测实例 1 上有);
-         换镜像时优先挑带 12.x 的那个。
+      ── 装法(走清华 conda-forge;这套包组合 setup_cloud_conda.sh 已实测编出过 _C)──
 
-      2) 加 --pip-nvcc,用 PyPI 的 nvidia-cuda-nvcc-cu12 拼假 CUDA_HOME。
-         ⚠️ 这条路【未经实测】,而且 nvidia-cuda-nvcc-cu12 只给 nvcc 不给头文件,
-         需要从 torch 自带的 nvidia-*-cu12 里凑 include/,未必凑得齐。
+        conda create -y -n cuda12 --override-channels \\
+          -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge \\
+          cuda-nvcc=12.9 cuda-cudart-dev=12.9 \\
+          libcublas-dev=12.9 libcusparse-dev=12.9 libcusolver-dev=12.9
 
-      3) 直接用 setup_cloud_conda.sh —— nvcc 与 torch 由同一个 solver 解出,
-         必然同源。代价是 12.6G env + 4.3G 下载 + 284 秒 solve,以及 torch 被
-         顶到 2.13.0+cu129。
+        export CUDA_HOME=/root/miniconda3/envs/cuda12
+        export PATH="\$CUDA_HOME/bin:\$PATH"
+        nvcc --version
 
-      不想现在决定,可以先跑:bash $(basename "$0") --check
+      后四个 dev 包不能省:torch 的 ATen 头文件无条件 include cublas_v2.h /
+      cublasLt.h / cusparse.h / cusolverDn.h,只有 nvcc 一样编不过。
+      12.9 与 torch 的 cu128 同为 major $TORCH_CUDA_MAJOR,按 torch 的规则只警告不报错。
+
+      装完在【同一个 shell】里 export 那两行,然后重跑本脚本;
+      或直接指定:bash $(basename "$0") --cuda-home /root/miniconda3/envs/cuda12
+
+      ── 其它出路 ──
+
+      · 换一个自带 /usr/local/cuda-12.x 的镜像(交接文档实测实例 1 上有)。
+      · 加 --pip-nvcc,用 PyPI 的 nvidia-cuda-nvcc-cu12 拼假 CUDA_HOME。
+        ⚠️ 这条路【未经实测】,且它只给 nvcc 不给头文件,要从 torch 自带的
+        nvidia-*-cu12 里凑 include/,未必凑得齐。
+      · 改用 setup_cloud_conda.sh —— nvcc 与 torch 由同一个 solver 解出,必然同源。
+        代价是 12.6G env + 4.3G 下载 + 284 秒 solve,以及 torch 被顶到 2.13.0+cu129。
+
+      先不改任何东西、只看现状:bash $(basename "$0") --check
 
 EOF
     die "没有可用的 nvcc"
