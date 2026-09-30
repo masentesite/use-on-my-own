@@ -54,6 +54,18 @@
 #              logger.warning(...)            # major 相同、minor 不同 → 只警告,照编
 #  所以只要 nvcc 的 major 是 12 就能用;镜像自带的 13.0 会炸(13≠12)。
 #
+#  ⚠️ 但"major=12"只是【第一道】条件:有 nvcc ≠ 能用。还有一批头文件必须落在
+#     $CUDA_HOME/include 下 —— cuda.h / cuda_runtime.h / cuda_runtime_api.h /
+#     cublas_v2.h / cublasLt.h / cusparse.h / cusolverDn.h,外加 crt/host_defines.h
+#     与 crt/host_config.h(后两个是前两个无条件 include 的,漏了同样炸)。
+#     缺任何一个都在第 7 步死在第一个 .cpp 上,报 "cuda_runtime_api.h: No such
+#     file or directory" —— 看着像 torch / uv / uv.lock 的问题,其实是 CUDA_HOME
+#     是个半成品(只装了 nvcc,或上次装到一半)。2026-09-30 实测踩过这个坑。
+#     第 6 步现在两头都查:候选必须 major 匹配【且】头文件齐全;不齐就地补
+#     (venv 里 torch 自带的 nvidia-*-cu12 优先,零下载;只有 crt/ 在 pip 那套里
+#      没有,才从 redist 取 cuda_nvcc 的 include/,约 78MB);补不齐直接 die 并给出
+#     三条出路,不再把这颗雷留到第 7 步。
+#
 #  ────────────────────────────────────────────────────────────────────────────
 #  可选参数:
 #      --check         只体检,不做任何改动
@@ -61,11 +73,16 @@
 #      --force         已存在的 .venv 也删掉重建
 #      --cuda-home DIR 手动指定 CUDA_HOME(nvcc 的 major 必须等于 12)
 #                      优先级高于自动扫描,用于镜像里的 12.x 装在冷门路径时
+#      --no-auto-cuda  镜像里没有 major 匹配的 nvcc 时【不要】自动下载(默认会下)。
+#                      默认行为:从 NVIDIA 官方 redist 拉一套 CUDA 12.x 到数据盘,
+#                      只解需要的组件,不装驱动、不碰系统 CUDA。
 #      --pip-nvcc      【已废弃】2026-09-30 实测:PyPI 的 nvidia-cuda-nvcc-cu12
 #                      里没有 nvcc 可执行文件。用了会直接报错退出,见第 6 步。
 #      --mirror-tuna URL / --mirror-pytorch URL / --mirror-python URL
 #                      覆盖三个镜像地址
 #      --foreground    不要自动进 screen(默认会自动进,见第 0 步)
+#      SKIP_HDR_CHECK=1(环境变量,不是参数)跳过第 6 步的"自动补头 + 缺头即 die"。
+#                      只在你的头文件是走 CPATH / 额外 -I 从别处喂进去时才需要。
 # ============================================================================
 
 # ⚠️ 刻意【不】加 -u(set -u)。
@@ -85,7 +102,7 @@ MIRROR_PYTORCH="${MIRROR_PYTORCH:-https://mirrors.nju.edu.cn/pytorch/whl/cu128}"
 MIRROR_PYTHON="${MIRROR_PYTHON:-https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone}"
 
 # ------------------------------ 参数 ------------------------------
-MODE="deploy"; FORCE=0; USE_PIP_NVCC=0; MAX_JOBS="${MAX_JOBS:-4}"; FOREGROUND=0
+MODE="deploy"; FORCE=0; USE_PIP_NVCC=0; AUTO_CUDA=1; MAX_JOBS="${MAX_JOBS:-4}"; FOREGROUND=0
 CUDA_HOME_ARG=""                 # --cuda-home 指定,优先级最高
 ORIG_ARGS=("$@")
 
@@ -97,6 +114,7 @@ while [ $# -gt 0 ]; do
     --jobs)           MAX_JOBS="$2"; shift ;;
     --force)          FORCE=1 ;;
     --pip-nvcc)       USE_PIP_NVCC=1 ;;
+    --no-auto-cuda)   AUTO_CUDA=0 ;;
     --cuda-home)      CUDA_HOME_ARG="$2"; shift ;;
     --mirror-tuna)    MIRROR_TUNA="$2"; shift ;;
     --mirror-pytorch) MIRROR_PYTORCH="$2"; shift ;;
@@ -335,6 +353,211 @@ nvcc_full() {   # $1 = nvcc 路径 → 打印 x.y
   "$1" --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1
 }
 
+# ---------------- 自动下载 CUDA 12.x(NVIDIA 官方 redist) ----------------
+# 扫不到 major 匹配的 nvcc 时,自己把一套装下来 —— 而不是打印一段话让人手敲。
+#
+# 不依赖 conda,只需要 curl + tar + python3:
+#   <base>/redistrib_<ver>.json 是一份带 sha256 的清单,每个组件的
+#   linux-x86_64.relative_path 就是 tarball 的路径。
+#   tarball 解出单层 <组件>-linux-x86_64-<版本>-archive/{bin,include,lib,nvvm},
+#   把这些目录的内容并到一起,就得到一个布局正确的 CUDA_HOME。
+#
+# ⚠️ 域名会 301 跳到 developer.download.nvidia.cn(国内 CDN),所以 curl 必须 -L。
+#
+# 组件清单是从 torch 的头文件倒推的,不是拍脑袋:
+#   ATen/cuda/CUDAContextLight.h(CUDAContext.h 无条件 include 它)里
+#   cuda_runtime_api.h / cusparse.h / cublas_v2.h / cublasLt.h / cusolverDn.h
+#   都是无条件 include,而 csrc 三个源文件全 include 了 CUDAContext.h。
+#
+#   cuda_nvcc        bin/nvcc + bin/{ptxas,nvlink,fatbinary} + nvvm/bin/{cicc,cudafe++}
+#   cuda_cudart      cuda.h / cuda_runtime.h / cuda_runtime_api.h + libcudart.so
+#   libcublas        cublas_v2.h / cublasLt.h          ┐
+#   libcusparse      cusparse.h                        ├ 只要 include/
+#   libcusolver      cusolverDn.h                      ┘
+#   cuda_cuobjdump   第 8 步校验 .so 里的算力用
+#
+# ⚠️ 那三个库的 tarball 各含一个多架构的大 .so(合计 1.6G),但 readelf -d 实测
+#    _C.so 的 NEEDED 里只有 libcudart —— cublas/cusparse/cusolver 根本没被链接,
+#    编 _C 只需要它们的头文件。所以解包时只取 include/,省下约 1.6G 磁盘。
+CUDA_REDIST_VER="${CUDA_REDIST_VER:-12.9.1}"
+CUDA_REDIST_BASE="${CUDA_REDIST_BASE:-https://developer.download.nvidia.com/compute/cuda/redist}"
+CUDA_REDIST_HEADERS_ONLY="${CUDA_REDIST_HEADERS_ONLY:-libcublas libcusparse libcusolver}"
+CUDA_REDIST_COMPONENTS="${CUDA_REDIST_COMPONENTS:-cuda_nvcc cuda_cudart libcublas libcusparse libcusolver cuda_cuobjdump}"
+
+install_cuda_redist() {   # $1 = 目标目录(即未来的 CUDA_HOME)
+  local dest="$1" ver="$CUDA_REDIST_VER" base="$CUDA_REDIST_BASE"
+  local cache="$dest/.download" manifest list name rel sha size tgz got total avail_kb need_kb
+
+  command -v python3 >/dev/null 2>&1 || { warn "需要 python3 解析清单,镜像里没有"; return 1; }
+  command -v curl    >/dev/null 2>&1 || { warn "需要 curl,镜像里没有";                return 1; }
+  mkdir -p "$cache" || return 1
+  manifest="$cache/redistrib_$ver.json"; list="$cache/list.tsv"
+
+  if [ ! -s "$manifest" ]; then
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$manifest" "$base/redistrib_$ver.json" \
+      || { warn "取清单失败:$base/redistrib_$ver.json"; return 1; }
+  fi
+  ok "清单 redistrib_$ver.json($(wc -c <"$manifest" | tr -d ' ') 字节)"
+
+  python3 - "$manifest" "$CUDA_REDIST_COMPONENTS" >"$list" <<'PY' || { warn "解析清单失败"; return 1; }
+import json, sys
+COMPONENTS = sys.argv[2].split()
+m = json.load(open(sys.argv[1]))
+for name in COMPONENTS:
+    f = (m.get(name) or {}).get("linux-x86_64") or {}
+    if not f.get("relative_path"):
+        sys.stderr.write("清单里没有 %s 的 linux-x86_64\n" % name)
+        sys.exit(1)
+    print("%s\t%s\t%s\t%s" % (name, f["relative_path"],
+                              f.get("sha256", ""), f.get("size", 0)))
+PY
+
+  total=0
+  while IFS=$'\t' read -r name rel sha size; do total=$((total + ${size:-0})); done <"$list"
+  avail_kb="$(df -Pk "$dest" 2>/dev/null | awk 'NR==2{print $4}')"
+  need_kb=$(( total / 1024 + 3 * 1024 * 1024 ))          # 下载量 + 3G 解包余量
+  if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$need_kb" ]; then
+    warn "可用 $((avail_kb / 1024))MB,本次约需 $((need_kb / 1024))MB —— 可能不够,先清点空间"
+  fi
+
+  while IFS=$'\t' read -r name rel sha size; do
+    [ -n "${rel:-}" ] || continue
+    tgz="$cache/$(basename "$rel")"
+    if [ -s "$tgz" ]; then
+      printf '  复用 %-16s %5s MB(上次已下)\n' "$name" "$((size / 1048576))"
+    else
+      printf '  下载 %-16s %5s MB  %s\n' "$name" "$((size / 1048576))" "$(basename "$rel")"
+      curl -fL --retry 3 -C - --connect-timeout 20 -o "$tgz" "$base/$rel" \
+        || { warn "$name 下载失败(重跑本脚本可断点续传)"; return 1; }
+    fi
+    if [ -n "$sha" ]; then
+      got="$(sha256sum "$tgz" | cut -d' ' -f1)"
+      [ "$got" = "$sha" ] || { warn "$name sha256 不符,已删除,重跑会重下:$tgz"; rm -f "$tgz"; return 1; }
+    fi
+
+    local _x="$cache/_x"; mkdir -p "$_x"
+    case " $CUDA_REDIST_HEADERS_ONLY " in
+      *" $name "*)
+        tar -xJf "$tgz" -C "$_x" --wildcards '*/include/*' 2>/dev/null \
+          || { warn "$name 解包(仅 include/)失败"; return 1; } ;;
+      *)
+        tar -xJf "$tgz" -C "$_x" || { warn "$name 解包失败"; return 1; } ;;
+    esac
+    for d in "$_x"/*/; do [ -d "$d" ] && cp -a "$d." "$dest/"; done
+    rm -rf "$_x"
+    ok "$name 就位"
+  done <"$list"
+
+  # ⚠️ cpp_extension 找的是 $CUDA_HOME/lib64 —— library_paths('cuda') 实测返回
+  #    $CUDA_HOME/lib64 和 lib 两个,而 redist 归档里只有 lib/。补个软链,
+  #    否则链接期 -lcudart 找不到(症状是 undefined reference to cudaXxx)。
+  [ -d "$dest/lib" ] && [ ! -e "$dest/lib64" ] && ln -s lib "$dest/lib64"
+
+  rm -rf "$cache"
+  return 0
+}
+
+# ---------------- CUDA 头文件体检 + 就地补头 ----------------
+# ⚠️ 判据不是"nvcc --version 能跑",而是【编 _C 要的那几个头在不在】。
+#    2026-09-30 实测踩过:只有 nvcc、没有 include/ 的"最小工具链"照样让 uv sync
+#    在第一个 .cpp 上炸,报的是 "cuda_runtime_api.h: No such file or directory",
+#    看着像 torch 或 uv 的问题,其实是 CUDA_HOME 缺头。
+#
+#    依赖链(torch 2.10 实测,两条都是【无条件】include,不在 #if 里):
+#      csrc/*.cpp|*.cu → ATen/cuda/CUDAContext.h → CUDAContextLight.h
+#        → <cuda_runtime_api.h> → cuda_runtime_api.h:148  crt/host_defines.h
+#        → <cusparse.h> <cublas_v2.h> <cublasLt.h> <cusolverDn.h>
+#      而 cuda_runtime.h:82 无条件 include crt/host_config.h
+#    所以 include/crt/ 和那 7 个一样是硬需求 —— 少了它报错文件名是
+#    crt/host_defines.h,很容易被误判成"nvcc 版本不对"去查半天。
+CUDA_HDRS="cuda.h cuda_runtime.h cuda_runtime_api.h cublas_v2.h cublasLt.h cusparse.h cusolverDn.h"
+CUDA_HDRS_CRT="crt/host_defines.h crt/host_config.h"
+
+cuda_headers_ok() {   # $1 = CUDA_HOME;0 = 齐全
+  local d="${1%/}" h
+  for h in $CUDA_HDRS $CUDA_HDRS_CRT; do [ -f "$d/include/$h" ] || return 1; done
+  return 0
+}
+cuda_headers_missing() {   # $1 = CUDA_HOME → 打印缺哪些(空=齐全)
+  local d="${1%/}" h
+  for h in $CUDA_HDRS $CUDA_HDRS_CRT; do [ -f "$d/include/$h" ] || printf '%s ' "$h"; done
+}
+cuda_headers_report() {    # $1 = CUDA_HOME;逐项打勾,缺的顺带说补哪个 conda 包
+  local d="${1%/}" h pkg
+  for h in $CUDA_HDRS $CUDA_HDRS_CRT; do
+    if [ -f "$d/include/$h" ]; then ok "  include/$h"
+    else
+      case "$h" in
+        crt/*|cuda.h|cuda_runtime.h|cuda_runtime_api.h) pkg="cuda-cudart-dev" ;;
+        cublas_v2.h|cublasLt.h)                         pkg="libcublas-dev" ;;
+        cusparse.h)                                     pkg="libcusparse-dev" ;;
+        cusolverDn.h)                                   pkg="libcusolver-dev" ;;
+        *)                                              pkg="?" ;;
+      esac
+      warn "  缺 include/$h —— 编译过不去。补装 conda 包:$pkg"
+    fi
+  done
+}
+
+# 补头:先零下载,再只取缺的那一点 redist 内容(不重下 1.4G)。
+#   ① venv —— torch wheel 依赖的 nvidia-*-cu12 pip 包里就带着这些头(实测):
+#        nvidia/cuda_runtime/include/{cuda.h,cuda_runtime.h,cuda_runtime_api.h}
+#        nvidia/cublas/include/{cublas_v2.h,cublasLt.h}
+#        nvidia/cusparse/include/cusparse.h   nvidia/cusolver/include/cusolverDn.h
+#      ⚠️ 光"venv 里有"没用:include_paths('cuda') 只返回 $CUDA_HOME/include,
+#         【不看】pip 那个目录,所以必须复制过去。
+#   ② crt/ —— pip 那套里【没有】(cudart 包里连 crt/ 目录都没有,而它的
+#      cuda_runtime.h 却 include "crt/host_config.h",所以 pip 世界靠
+#      nvidia-cuda-nvcc-cu12 补这一块)。这里改用 redist 的 cuda_nvcc,只解
+#      include/(77MB),不碰已就位的 nvcc 本体,也不往 venv 里塞包
+#      (塞了也会被后面 uv sync --frozen 清掉)。
+#   ③ 万一 venv 里连 nvidia-cuda-runtime-cu12 都没有(全新机器,还没 uv sync),
+#      再从 redist 取 cuda_cudart(1.4MB)。
+# 返回 0 = 试过了(不代表补齐;调用方一律用 cuda_headers_ok 复核)。
+topup_cuda_headers() {
+  local home="${1%/}" sp d n=0 need="" _sc _sh rc=0
+  mkdir -p "$home/include" || return 1
+  cuda_headers_ok "$home" && return 0
+
+  for sp in "${UV_PROJECT_ENVIRONMENT:-$PROJECT_DIR/.venv}"/lib/python*/site-packages/nvidia; do
+    [ -d "$sp" ] || continue
+    for d in "$sp"/*/include; do
+      [ -d "$d" ] || continue
+      cp -an "$d"/. "$home/include/" 2>/dev/null && n=$((n + 1))
+    done
+  done
+  [ "$n" -gt 0 ] && ok "  从 venv 的 nvidia-*-cu12 并了 $n 个包的 include/(零下载)"
+
+  cuda_headers_ok "$home" && return 0
+  for h in $CUDA_HDRS_CRT; do
+    [ -f "$home/include/$h" ] || { need="cuda_nvcc"; break; }
+  done
+  if [ ! -f "$home/include/cuda.h" ] || [ ! -f "$home/include/cuda_runtime.h" ] \
+     || [ ! -f "$home/include/cuda_runtime_api.h" ]; then
+    need="$need cuda_cudart"
+  fi
+  need="${need# }"
+  [ -n "$need" ] || return 0
+
+  warn "  仍缺:$(cuda_headers_missing "$home")  → 从 redist 只取 include/:$need"
+  _sc="$CUDA_REDIST_COMPONENTS"; _sh="$CUDA_REDIST_HEADERS_ONLY"
+  CUDA_REDIST_COMPONENTS="$need"
+  CUDA_REDIST_HEADERS_ONLY="$need"
+  install_cuda_redist "$home" || rc=1
+  CUDA_REDIST_COMPONENTS="$_sc"; CUDA_REDIST_HEADERS_ONLY="$_sh"
+  return $rc
+}
+
+# 补头总入口:零下载 → 还不行就整组件装(幂等,已下的 tarball 会复用)。
+ensure_cuda_headers() {   # $1 = CUDA_HOME;0 = 齐了
+  local home="${1%/}"
+  cuda_headers_ok "$home" && return 0
+  topup_cuda_headers "$home"
+  cuda_headers_ok "$home" && return 0
+  warn "  零下载补不齐(venv 里没有那套 pip 头),退回整组件安装(约 1.4G)"
+  install_cuda_redist "$home" && cuda_headers_ok "$home"
+}
+
 CUDA_ROOT=""
 # 逐个候选看过去,取第一个 major 匹配的。
 # ⚠️ 别硬编码版本号。最初这里写死了 /usr/local/cuda-12.8 / -12.9 / -12.6 / -12.4,
@@ -351,55 +574,133 @@ for _g in /usr/local/cuda* /opt/cuda* "${CONDA_PREFIX:-/nonexistent}" \
 done
 
 _seen_list=""
+_repair_cand=""     # major 对、但头文件不全的"半成品":优先就地补,省一次 1.4G 下载
 for _cand in "${_cands[@]}"; do
   [ -x "$_cand/bin/nvcc" ] || continue
   case "$_seen_list" in *"|$_cand|"*) continue ;; esac     # 去重
   _seen_list="$_seen_list|$_cand|"
   _m="$(nvcc_major "$_cand/bin/nvcc")"
-  printf '  候选 %-36s nvcc %s\n' "$_cand" "$(nvcc_full "$_cand/bin/nvcc")"
-  if [ "$_m" = "$TORCH_CUDA_MAJOR" ]; then CUDA_ROOT="$_cand"; break; fi
+  if [ "$_m" != "$TORCH_CUDA_MAJOR" ]; then
+    printf '  候选 %-36s nvcc %s(major≠%s,跳过)\n' \
+      "$_cand" "$(nvcc_full "$_cand/bin/nvcc")" "$TORCH_CUDA_MAJOR"
+    continue
+  fi
+  # ⚠️ 有 nvcc ≠ 能用。major 对了还要看头文件齐不齐 —— 镜像里那种"只装了 nvcc
+  #    的最小工具链"以前会被直接选中,然后在第 7 步炸在第一个 .cpp 上。
+  if cuda_headers_ok "$_cand"; then
+    printf '  候选 %-36s nvcc %s\n' "$_cand" "$(nvcc_full "$_cand/bin/nvcc")"
+    CUDA_ROOT="$_cand"; break
+  fi
+  printf '  候选 %-36s nvcc %s ← 缺头文件:%s\n' \
+    "$_cand" "$(nvcc_full "$_cand/bin/nvcc")" "$(cuda_headers_missing "$_cand")"
+  [ -n "$_repair_cand" ] || _repair_cand="$_cand"
 done
+
+# 找到的只有半成品 → 就地补头(零下载优先),而不是为此再下一整套 1.4G。
+if [ -z "$CUDA_ROOT" ] && [ -n "$_repair_cand" ]; then
+  warn "$_repair_cand:nvcc major 对,但头文件不全(上次装到一半?只装了 nvcc?)"
+  if [ "$MODE" = "check" ]; then
+    warn "  (体检)未改动。实际执行会就地补头:venv 里 torch 自带的 nvidia-*-cu12"
+    warn "  已含大部分,通常只需再从 redist 取 crt/(约 78MB),不会重下 1.4G。"
+    warn "  ⇒ 这种状态【不需要】手工 conda 装那套 4-5G 的工具链,直接跑本脚本就行。"
+    say "体检模式(--check):到此为止,未做任何改动"
+    exit 0
+  elif ensure_cuda_headers "$_repair_cand"; then
+    CUDA_ROOT="$_repair_cand"
+    ok "补齐后可用:CUDA_HOME=$CUDA_ROOT"
+  else
+    warn "补不齐,继续按'镜像里没有可用的 nvcc'处理"
+  fi
+fi
+
+# 扫不到 major 匹配的 → 自己装一套。把看到的版本说清楚,别让人以为"没装 CUDA"。
+if [ -z "$CUDA_ROOT" ]; then
+  _seen="$(for c in /usr/local/cuda*; do [ -x "$c/bin/nvcc" ] && printf '%s ' "$(nvcc_full "$c/bin/nvcc")"; done)"
+  if [ -n "$_repair_cand" ]; then
+    # 别在这里说"没有 major=12 的 nvcc" —— 上面刚打过候选行,自相矛盾。
+    warn "nvcc major 对但不完整的那套($(nvcc_full "$_repair_cand/bin/nvcc"))没被采用"
+  else
+    warn "没有找到 major=$TORCH_CUDA_MAJOR 的 nvcc。镜像里实际有:${_seen:-无}"
+  fi
+
+  AUTO_CUDA_DIR="${AUTO_CUDA_DIR:-$DATA_DISK/cuda$TORCH_CUDA_MAJOR}"
+  if ! mkdir -p "$AUTO_CUDA_DIR" 2>/dev/null; then
+    AUTO_CUDA_DIR="$PROJECT_DIR/.cuda$TORCH_CUDA_MAJOR"
+    mkdir -p "$AUTO_CUDA_DIR" || die "建不出 CUDA 安装目录"
+    warn "数据盘不可写,改装到 $AUTO_CUDA_DIR"
+  fi
+
+  # ⚠️ 这里原来只查 bin/nvcc —— 于是"上次装到一半"的目录被当成装好的,每跑一次
+  #    都在第 7 步撞同一堵墙(2026-09-30 实测:/root/autodl-tmp/cuda12 有 nvcc 12.9、
+  #    没有 include/,报的是 cuda_runtime_api.h: No such file or directory)。
+  #    改为连头文件一起复核;不全就地补,不整目录重下。
+  if [ -x "$AUTO_CUDA_DIR/bin/nvcc" ] && cuda_headers_ok "$AUTO_CUDA_DIR"; then
+    ok "已有装好的:$AUTO_CUDA_DIR (nvcc $(nvcc_full "$AUTO_CUDA_DIR/bin/nvcc"))"
+    CUDA_ROOT="$AUTO_CUDA_DIR"
+  elif [ -x "$AUTO_CUDA_DIR/bin/nvcc" ]; then
+    warn "已有 nvcc 但头文件不全(半成品):$AUTO_CUDA_DIR"
+    warn "  缺:$(cuda_headers_missing "$AUTO_CUDA_DIR")"
+    if [ "$MODE" = "check" ]; then
+      warn "  (体检)未改动。实际执行会就地补:零下载优先,不够才从 redist 取"
+    elif ensure_cuda_headers "$AUTO_CUDA_DIR"; then
+      CUDA_ROOT="$AUTO_CUDA_DIR"
+      ok "补齐后可用:CUDA_HOME=$CUDA_ROOT"
+    else
+      warn "补不齐,当作没装过"
+    fi
+  elif [ "$MODE" = "check" ]; then
+    warn "(体检)未下载。实际执行会从 NVIDIA redist 拉 CUDA $CUDA_REDIST_VER 到"
+    warn "  $AUTO_CUDA_DIR(约 1.7G 下载,只解需要的组件,不碰系统 CUDA、不装驱动)"
+  elif [ "$AUTO_CUDA" != 1 ]; then
+    warn "--no-auto-cuda:跳过自动下载"
+  elif [ "$USE_PIP_NVCC" = 1 ]; then
+    :                                   # 交给下面的 --pip-nvcc 报错分支
+  else
+    if install_cuda_redist "$AUTO_CUDA_DIR" && cuda_headers_ok "$AUTO_CUDA_DIR"; then
+      CUDA_ROOT="$AUTO_CUDA_DIR"
+      ok "自动装好了:CUDA_HOME=$AUTO_CUDA_DIR"
+    elif [ -x "$AUTO_CUDA_DIR/bin/nvcc" ]; then
+      warn "装完了但头文件仍不全:$(cuda_headers_missing "$AUTO_CUDA_DIR")"
+      warn "  这不该发生 —— 把上面几行连同 'ls $AUTO_CUDA_DIR/include' 一起发出来。"
+    else
+      warn "自动下载没成功。可重跑本脚本续传(已下的 tarball 会复用);"
+      warn "或者照下面换成 conda 方案。"
+    fi
+  fi
+fi
 
 if [ -n "$CUDA_ROOT" ]; then
   export CUDA_HOME="$CUDA_ROOT"
   export PATH="$CUDA_HOME/bin:$PATH"
   ok "CUDA_HOME=$CUDA_HOME (nvcc $(nvcc_full "$CUDA_HOME/bin/nvcc"),major 匹配 torch 的 cu$TORCH_CUDA_MAJOR)"
-  # 编 _C 需要的不只是 nvcc,还有一批 CUDA 头文件。
-  # 依据(torch 2.10 实测):ATen/cuda/CUDAContext.h 无条件 include CUDAContextLight.h,
-  # 后者里这几行是【无条件】的(cudss.h / hipsolver.h 在 #if 里,本项目用不到):
-  #     #include <cuda_runtime_api.h>
-  #     #include <cusparse.h>
-  #     #include <cublas_v2.h>
-  #     #include <cublasLt.h>
-  #     #ifdef CUDART_VERSION
-  #     #include <cusolverDn.h>     ← CUDART_VERSION 上面刚定义过,等同无条件
-  #     #endif
-  # 而 csrc 三个源文件(ms_deform_attn_cuda.cu / ms_deform_im2col_cuda.cuh /
-  # ms_deform_attn_cpu.cpp)【全都】include 了 <ATen/cuda/CUDAContext.h>。
-  #
-  # ⚠️ torch wheel 自带的 nvidia-*-cu12 pip 包里【确实有】这些头(在
-  #    site-packages/nvidia/*/include),但实测 include_paths('cuda') 只返回
-  #    torch/include + torch/include/torch/csrc/api/include + $CUDA_HOME/include,
-  #    【不含】pip 那个目录。所以这些头必须落在 $CUDA_HOME/include 下 ——
-  #    只装 nvcc 是编不过的。
-  for _h in cuda.h cuda_runtime.h cuda_runtime_api.h cublas_v2.h cublasLt.h cusparse.h cusolverDn.h; do
-    if [ -f "$CUDA_HOME/include/$_h" ]; then ok "  include/$_h"
-    else
-      case "$_h" in
-        cuda.h|cuda_runtime.h|cuda_runtime_api.h) _pkg="cuda-cudart-dev" ;;
-        cublas_v2.h|cublasLt.h)                   _pkg="libcublas-dev" ;;
-        cusparse.h)                               _pkg="libcusparse-dev" ;;
-        cusolverDn.h)                             _pkg="libcusolver-dev" ;;
-        *)                                        _pkg="?" ;;
-      esac
-      warn "  缺 include/$_h —— 编译过不去。补装 conda 包:$_pkg"
-    fi
-  done
-else
-  # 没找到 major 匹配的。把实际看到的版本说清楚,别让人以为"没装 CUDA"。
-  _seen="$(for c in /usr/local/cuda*; do [ -x "$c/bin/nvcc" ] && printf '%s ' "$(nvcc_full "$c/bin/nvcc")"; done)"
-  warn "没有找到 major=$TORCH_CUDA_MAJOR 的 nvcc。镜像里实际有:${_seen:-无}"
 
+  # 编 _C 要的不只是 nvcc,还有那 8 个头。依据与依赖链见上面 cuda_headers_ok 的
+  # 注释(cuda_runtime_api.h:148 无条件 include crt/host_defines.h;cuda_runtime.h:82
+  # 无条件 include crt/host_config.h;而 csrc 三个源文件全都 include 了
+  # <ATen/cuda/CUDAContext.h>)。缺了就在这里补齐 / 说清楚 ——
+  # 以前只 warn 一句就往下走,结果是第 7 步一屏编译器报错,还得回头猜。
+  if ! cuda_headers_ok "$CUDA_HOME"; then
+    warn "头文件不全,缺:$(cuda_headers_missing "$CUDA_HOME")"
+    if [ "$MODE" = "check" ]; then
+      :                       # 体检模式不改任何东西,下面照常逐项报告
+    elif [ "${SKIP_HDR_CHECK:-0}" = 1 ]; then
+      warn "SKIP_HDR_CHECK=1:跳过自动补头(头文件由你自己从别处喂时用)"
+    else
+      warn "就地补:venv 里 torch 自带的 nvidia-*-cu12 优先(零下载),不够才从 redist 取"
+      ensure_cuda_headers "$CUDA_HOME" || true
+    fi
+  fi
+  cuda_headers_report "$CUDA_HOME"
+  if [ "$MODE" != "check" ] && [ "${SKIP_HDR_CHECK:-0}" != 1 ] && ! cuda_headers_ok "$CUDA_HOME"; then
+    die "头文件仍不全,再往下跑必然在第 7 步炸在第一个 .cpp 上(报 cuda_runtime_api.h 那类)。三条出路任选其一:
+         · 往同一个 CUDA_HOME 补 conda 包(⚠️ 用 -p 不用 -n,别占系统盘):
+             conda install -p $CUDA_HOME -c nvidia \\
+               cuda-cudart-dev libcublas-dev libcusparse-dev libcusolver-dev
+         · --cuda-home 指向另一套【dev 齐全】的 CUDA 12.x
+         · 让本脚本整装一套:unset CUDA_HOME 后删掉这个目录再重跑,
+           会从 NVIDIA redist 拉全 6 个组件(约 1.4G)"
+  fi
+else
   if [ "$USE_PIP_NVCC" = 1 ]; then
     # 2026-09-30 实测判死刑,原实现(拼假 CUDA_HOME)已整段删除。
     # 留这个分支只为把证据说清楚,不再做任何尝试。
@@ -455,10 +756,13 @@ else
           #include <cusolverDn.h>     ← CUDART_VERSION 上面刚定义过,等同无条件
           #endif
 
-      ⚠️ 别指望 torch wheel 自带的 nvidia-*-cu12 pip 包顶替:那些头【确实在】
-         site-packages/nvidia/*/include 里,但实测 include_paths('cuda') 只返回
+      💡 torch wheel 自带的 nvidia-*-cu12 pip 包里【已经含】这批头里的大部分
+         (site-packages/nvidia/*/include)。实测 include_paths('cuda') 只返回
          torch/include + torch/include/torch/csrc/api/include + \$CUDA_HOME/include,
-         【不含】pip 那个目录。所以头必须落在 \$CUDA_HOME/include 下。
+         【不含】pip 那个目录 —— 但【复制过去就能用】,本脚本第 6 步已经会自动做
+         (零下载);只有 crt/ 在 pip 那套里没有,才需要从 redist 取 cuda_nvcc 的
+         include/(约 78MB,不重下 1.4G)。
+         真要自己喂头文件、不想让它自动补:export SKIP_HDR_CHECK=1。
 
       12.9 与 torch 的 cu128 同为 major $TORCH_CUDA_MAJOR,按 torch 的规则只警告不报错。
 
