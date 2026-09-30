@@ -61,8 +61,8 @@
 #      --force         已存在的 .venv 也删掉重建
 #      --cuda-home DIR 手动指定 CUDA_HOME(nvcc 的 major 必须等于 12)
 #                      优先级高于自动扫描,用于镜像里的 12.x 装在冷门路径时
-#      --pip-nvcc      没有合适 nvcc 时,尝试用 PyPI 的 nvidia-cuda-nvcc-cu12
-#                      搭一个假 CUDA_HOME(⚠️ 本方案【未经验证】,见第 6 步)
+#      --pip-nvcc      【已废弃】2026-09-30 实测:PyPI 的 nvidia-cuda-nvcc-cu12
+#                      里没有 nvcc 可执行文件。用了会直接报错退出,见第 6 步。
 #      --mirror-tuna URL / --mirror-pytorch URL / --mirror-python URL
 #                      覆盖三个镜像地址
 #      --foreground    不要自动进 screen(默认会自动进,见第 0 步)
@@ -364,10 +364,35 @@ if [ -n "$CUDA_ROOT" ]; then
   export CUDA_HOME="$CUDA_ROOT"
   export PATH="$CUDA_HOME/bin:$PATH"
   ok "CUDA_HOME=$CUDA_HOME (nvcc $(nvcc_full "$CUDA_HOME/bin/nvcc"),major 匹配 torch 的 cu$TORCH_CUDA_MAJOR)"
-  # 编 _C 需要的不只是 nvcc,还有头文件 —— ATen 无条件 include cublas_v2.h 等
-  for _h in cuda_runtime.h cublas_v2.h cublasLt.h cusparse.h cusolverDn.h; do
+  # 编 _C 需要的不只是 nvcc,还有一批 CUDA 头文件。
+  # 依据(torch 2.10 实测):ATen/cuda/CUDAContext.h 无条件 include CUDAContextLight.h,
+  # 后者里这几行是【无条件】的(cudss.h / hipsolver.h 在 #if 里,本项目用不到):
+  #     #include <cuda_runtime_api.h>
+  #     #include <cusparse.h>
+  #     #include <cublas_v2.h>
+  #     #include <cublasLt.h>
+  #     #ifdef CUDART_VERSION
+  #     #include <cusolverDn.h>     ← CUDART_VERSION 上面刚定义过,等同无条件
+  #     #endif
+  # 而 csrc 三个源文件(ms_deform_attn_cuda.cu / ms_deform_im2col_cuda.cuh /
+  # ms_deform_attn_cpu.cpp)【全都】include 了 <ATen/cuda/CUDAContext.h>。
+  #
+  # ⚠️ torch wheel 自带的 nvidia-*-cu12 pip 包里【确实有】这些头(在
+  #    site-packages/nvidia/*/include),但实测 include_paths('cuda') 只返回
+  #    torch/include + torch/include/torch/csrc/api/include + $CUDA_HOME/include,
+  #    【不含】pip 那个目录。所以这些头必须落在 $CUDA_HOME/include 下 ——
+  #    只装 nvcc 是编不过的。
+  for _h in cuda.h cuda_runtime.h cuda_runtime_api.h cublas_v2.h cublasLt.h cusparse.h cusolverDn.h; do
     if [ -f "$CUDA_HOME/include/$_h" ]; then ok "  include/$_h"
-    else warn "  缺 include/$_h —— 编译大概率过不去(需要完整 toolkit,不是只有 nvcc)"
+    else
+      case "$_h" in
+        cuda.h|cuda_runtime.h|cuda_runtime_api.h) _pkg="cuda-cudart-dev" ;;
+        cublas_v2.h|cublasLt.h)                   _pkg="libcublas-dev" ;;
+        cusparse.h)                               _pkg="libcusparse-dev" ;;
+        cusolverDn.h)                             _pkg="libcusolver-dev" ;;
+        *)                                        _pkg="?" ;;
+      esac
+      warn "  缺 include/$_h —— 编译过不去。补装 conda 包:$_pkg"
     fi
   done
 else
@@ -375,58 +400,76 @@ else
   _seen="$(for c in /usr/local/cuda*; do [ -x "$c/bin/nvcc" ] && printf '%s ' "$(nvcc_full "$c/bin/nvcc")"; done)"
   warn "没有找到 major=$TORCH_CUDA_MAJOR 的 nvcc。镜像里实际有:${_seen:-无}"
 
-  if [ "$USE_PIP_NVCC" = 1 ] && [ "$MODE" != "check" ]; then
-    # ⚠️⚠️ 以下路径 2026-09-30 时【尚未实测通过】—— 交接文档 §7.1 把它列为待验证项。
-    # 思路:nvidia-cuda-nvcc-cu12 提供 12.x 的 nvcc;头文件靠 torch wheel 自带的
-    # nvidia-*-cu12 包;把两者拼成一个假 CUDA_HOME 喂给 cpp_extension。
-    warn "--pip-nvcc:尝试用 PyPI 的 nvidia-cuda-nvcc-cu12 拼一个假 CUDA_HOME(未验证方案)"
-    uv pip install --python "$PROJECT_DIR/.venv/bin/python" nvidia-cuda-nvcc-cu12 2>/dev/null \
-      || "$(command -v python3 || command -v python)" -m pip install -q nvidia-cuda-nvcc-cu12 -i "$MIRROR_TUNA" \
-      || die "装 nvidia-cuda-nvcc-cu12 失败"
-    _sp="$("$(command -v python3 || command -v python)" -c 'import site;print(site.getsitepackages()[0])' 2>/dev/null)"
-    FAKE="$DATA_DISK/fake-cuda"
-    mkdir -p "$FAKE/bin" "$FAKE/include" "$FAKE/lib"
-    ln -sf "$_sp/nvidia/cuda_nvcc/bin/nvcc" "$FAKE/bin/nvcc" 2>/dev/null
-    # 头文件从 torch 自带的 nvidia-*-cu12 里凑
-    for d in cuda_runtime cublas cusparse cusolver; do
-      [ -d "$_sp/nvidia/${d}/include" ] && cp -n "$_sp/nvidia/${d}/include/"* "$FAKE/include/" 2>/dev/null
-    done
-    export CUDA_HOME="$FAKE"; export PATH="$FAKE/bin:$PATH"
-    if [ -n "$(nvcc_full "$FAKE/bin/nvcc")" ]; then
-      ok "假 CUDA_HOME 已搭好:$FAKE (nvcc $(nvcc_full "$FAKE/bin/nvcc"))"
-      warn "这是未验证路径。若第 8 步 _C 没编出来,请改用 conda 版脚本。"
-    else
-      die "假 CUDA_HOME 没搭起来(nvcc 不可执行)"
-    fi
+  if [ "$USE_PIP_NVCC" = 1 ]; then
+    # 2026-09-30 实测判死刑,原实现(拼假 CUDA_HOME)已整段删除。
+    # 留这个分支只为把证据说清楚,不再做任何尝试。
+    die "--pip-nvcc 已废弃:PyPI 的 nvidia-cuda-nvcc-cu12 里【根本没有 nvcc】。
+       实测装了 95MB,查它的 RECORD 只有 30 个文件,可执行的仅此一个:
+         nvidia/cuda_nvcc/bin/ptxas
+       外加 nvidia/cuda_nvcc/include/crt/*.h。
+       nvcc 是个驱动器,要调 cudafe++ / cicc / ptxas / nvlink / fatbinary 一整套,
+       这些包里一个都没有 —— 拼不出能用的 CUDA_HOME。
+       → 请按下面的 conda 方案装一套真工具链。"
   else
     cat <<EOF
 
-      需要一套 major=$TORCH_CUDA_MAJOR 的 CUDA toolkit(nvcc + 头文件)。
+      需要一套 major=$TORCH_CUDA_MAJOR 的 CUDA 工具链:nvcc + 下面这批头文件。
 
-      ── 装法(走清华 conda-forge;这套包组合 setup_cloud_conda.sh 已实测编出过 _C)──
+      ── 装法(清华 conda-forge;依赖清单 2026-09-30 按 torch 2.10 头文件核实过)──
 
-        conda create -y -n cuda12 --override-channels \\
+        # ⚠️ 用 -p 不用 -n:默认的 -n 会落到 /root/miniconda3/envs(系统盘 30G),
+        #    全量工具链 4-5G 会把它撑爆。数据盘才是 .venv 该待的地方。
+        conda create -y -p $DATA_DISK/cuda12 --override-channels \\
           -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge \\
-          cuda-nvcc=12.9 cuda-cudart-dev=12.9 \\
-          libcublas-dev=12.9 libcusparse-dev=12.9 libcusolver-dev=12.9
+          cuda-version=12.9 \\
+          cuda-nvcc cuda-cudart-dev \\
+          libcublas-dev libcusparse-dev libcusolver-dev \\
+          cuda-cuobjdump
 
-        export CUDA_HOME=/root/miniconda3/envs/cuda12
+        export CUDA_HOME=$DATA_DISK/cuda12
         export PATH="\$CUDA_HOME/bin:\$PATH"
         nvcc --version
 
-      后四个 dev 包不能省:torch 的 ATen 头文件无条件 include cublas_v2.h /
-      cublasLt.h / cusparse.h / cusolverDn.h,只有 nvcc 一样编不过。
+      ⚠️ 写法要点:只把 cuda-version=12.9 当【锚】,其余六个【一个都不锁版本】。
+         这是已验证的写法;给每个包都写 =12.9 会把 conda 逼进无解或退到老版本。
+
+      为什么是这七个包 —— 不是"随便装个 nvcc 就行":
+
+        cuda-nvcc         编译器本体。nvcc 是个驱动器,要调 cudafe++ / cicc /
+                          ptxas / nvlink / fatbinary 一整套,单个可执行文件没用。
+        cuda-cudart-dev   cuda.h / cuda_runtime.h / cuda_runtime_api.h
+        libcublas-dev     cublas_v2.h / cublasLt.h
+        libcusparse-dev   cusparse.h
+        libcusolver-dev   cusolverDn.h
+        cuda-cuobjdump    第 8 步验证 .so 里的 sm_$GPU_CAP 要用它。它是【单独的包】,
+                          不跟着 cuda-nvcc 走,漏了第 8 步只能跳过校验。
+
+      前五个缺一不可。原因是 torch 的 ATen/cuda/CUDAContextLight.h 里这几行
+      【无条件】include,而 csrc 三个源文件全都 include 了 CUDAContext.h:
+
+          #include <cuda_runtime_api.h>
+          #include <cusparse.h>
+          #include <cublas_v2.h>
+          #include <cublasLt.h>
+          #ifdef CUDART_VERSION
+          #include <cusolverDn.h>     ← CUDART_VERSION 上面刚定义过,等同无条件
+          #endif
+
+      ⚠️ 别指望 torch wheel 自带的 nvidia-*-cu12 pip 包顶替:那些头【确实在】
+         site-packages/nvidia/*/include 里,但实测 include_paths('cuda') 只返回
+         torch/include + torch/include/torch/csrc/api/include + \$CUDA_HOME/include,
+         【不含】pip 那个目录。所以头必须落在 \$CUDA_HOME/include 下。
+
       12.9 与 torch 的 cu128 同为 major $TORCH_CUDA_MAJOR,按 torch 的规则只警告不报错。
 
       装完在【同一个 shell】里 export 那两行,然后重跑本脚本;
-      或直接指定:bash $(basename "$0") --cuda-home /root/miniconda3/envs/cuda12
+      或直接指定:bash $(basename "$0") --cuda-home $DATA_DISK/cuda12
 
       ── 其它出路 ──
 
       · 换一个自带 /usr/local/cuda-12.x 的镜像(交接文档实测实例 1 上有)。
-      · 加 --pip-nvcc,用 PyPI 的 nvidia-cuda-nvcc-cu12 拼假 CUDA_HOME。
-        ⚠️ 这条路【未经实测】,且它只给 nvcc 不给头文件,要从 torch 自带的
-        nvidia-*-cu12 里凑 include/,未必凑得齐。
+        ⚠️ 但那个 12.x 必须是【dev 齐全】的 —— 只有 nvcc、没有上面那批头文件的
+           "最小工具链"照样编不过,别看到 nvcc --version 能跑就以为成了。
       · 改用 setup_cloud_conda.sh —— nvcc 与 torch 由同一个 solver 解出,必然同源。
         代价是 12.6G env + 4.3G 下载 + 284 秒 solve,以及 torch 被顶到 2.13.0+cu129。
 
@@ -513,8 +556,16 @@ PY
 
 # 最后确认一遍 .so 里真的含本机算力,而不是捡了上一台机器留下的
 _so_now="$(find "$PROJECT_DIR/GroundingDINO" -maxdepth 3 -name '_C*.so' 2>/dev/null | head -1)"
-if [ -n "$_so_now" ] && command -v cuobjdump >/dev/null 2>&1; then
-  if cuobjdump --list-elf "$_so_now" 2>/dev/null | grep -q "sm_${GPU_CAP}"; then
+if [ -n "$_so_now" ]; then
+  # ⚠️ 不能因为缺 cuobjdump 就【静默跳过】这一步 —— 这是"装成功"和"真编对了"
+  #    之间唯一能被自动发现的地方,跳过等于把风险留到训练第一次前向。
+  #    cuobjdump 在 conda 里是单独的 cuda-cuobjdump 包,不跟着 cuda-nvcc 走。
+  if ! command -v cuobjdump >/dev/null 2>&1; then
+    warn "找不到 cuobjdump,【跳过了】_C.so 的算力校验 —— 这条别不当回事。
+         它属于单独的 conda 包,装上后手动补验:
+           conda install -p ${CUDA_HOME:-<cuda-env>} cuda-cuobjdump
+           cuobjdump --list-elf $_so_now | grep sm_${GPU_CAP}"
+  elif cuobjdump --list-elf "$_so_now" 2>/dev/null | grep -q "sm_${GPU_CAP}"; then
     ok "_C.so 含 sm_${GPU_CAP}(与当前卡匹配)"
   else
     warn "_C.so 里没看到 sm_${GPU_CAP} —— 若训练时报 no kernel image,删掉重编:
